@@ -89,7 +89,7 @@ static_resources:
                 address: 127.0.0.1
                 port_value: 80
   - name: crowdsec_cluster
-    type: STATIC
+    type: LOGICAL_DNS
     # Comment out the following line to test on v6 networks
     dns_lookup_family: V4_ONLY
     load_assignment:
@@ -99,6 +99,6 @@ static_resources:
         - endpoint:
             address:
               socket_address:
-                address: 127.0.0.1
-                port_value: 8081
+                address: crowdsec
+                port_value: 8080
 

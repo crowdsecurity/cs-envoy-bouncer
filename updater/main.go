@@ -3,6 +3,8 @@ package main
 import (
 	"fmt"
 	"net/netip"
+	"os"
+	"runtime/pprof"
 	"time"
 
 	"github.com/gofrs/uuid"
@@ -271,6 +273,23 @@ func (p *pluginContext) dispatchCallback(numHeaders int, bodySize int, numTraile
 	proxywasm.LogInfof("Received decisions stream response: %d deleted decisions", deletedCount)
 	proxywasm.LogInfof("Received decisions stream response: %d new decisions", newCount)
 
+	if newCount != 0 {
+		dumpFile, err := os.Create("heap_profile.dump")
+
+		if err != nil {
+			proxywasm.LogCriticalf("failed to create heap profile dump file: %v", err)
+			return
+		}
+		defer dumpFile.Close()
+
+		err = pprof.WriteHeapProfile(dumpFile)
+
+		if err != nil {
+			proxywasm.LogCriticalf("failed to write heap profile: %v", err)
+			return
+		}
+	}
+
 	return
 }
 
@@ -292,8 +311,8 @@ func (p *pluginContext) OnTick() {
 		{":path", path},
 		{"User-Agent", "cs-envoy-bouncer/0.1"},
 		// FIXME: add configuration support for authority
-		{":authority", "127.0.0.1:8081"}, // This *needs* to match the cluster definition in the Envoy config
-		{"x-api-key", "wdSHRCAKfDf5Oe7MSDb4ZeKgFAqqBE3n/EbezrorkOA"},
+		{":authority", "crowdsec:8080"}, // This *needs* to match the cluster definition in the Envoy config
+		{"x-api-key", "thisisabouncerkey"},
 	}
 	_, err = proxywasm.DispatchHttpCall("crowdsec_cluster", headers, nil, nil, 6000, p.dispatchCallback)
 

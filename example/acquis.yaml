@@ -1,0 +1,5 @@
+# Just need to make crowdsec start
+filenames:
+ - /logs/auth.log
+labels:
+  type: syslog

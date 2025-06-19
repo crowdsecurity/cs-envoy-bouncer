@@ -15,11 +15,12 @@ type vmContext struct {
 
 type pluginContext struct {
 	types.DefaultPluginContext
-	contextID  uint32
-	pluginUUID string
-	vmID       string
-	queueID    uint32
-	queueName  string
+	contextID      uint32
+	pluginUUID     string
+	vmID           string
+	queueID        uint32
+	queueName      string
+	queueReadCount int
 }
 
 type httpContext struct {
@@ -133,6 +134,7 @@ func (p *pluginContext) OnPluginStart(pluginConfigurationSize int) types.OnPlugi
 }
 
 func (p *pluginContext) OnTick() {
+	proxywasm.LogInfof("queue read count: %d", p.queueReadCount)
 	if hasSentName {
 		return
 	}
@@ -171,6 +173,7 @@ func (p *pluginContext) OnQueueReady(queueID uint32) {
 		proxywasm.LogCriticalf("failed to dequeue shared queue: %v", err)
 		return
 	}
+	p.queueReadCount++
 
 	//proxywasm.ResolveSharedQueue()
 }

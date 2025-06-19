@@ -2,12 +2,26 @@ version: '3'
 services:
   envoy:
     image: envoyproxy/envoy:debug-v1.34-latest
-    #ports:
-    #  - "10000:10000"
+    depends_on:
+      - crowdsec
+    ports:
+      - "10000:10000"
     volumes:
       - ./envoy.yaml:/etc/envoy/envoy.yaml
       - ./../filter/filter.wasm:/etc/envoy/crowdsec_filter.wasm
       - ./../updater/updater.wasm:/etc/envoy/crowdsec_updater.wasm
-#    command: >
-#      envoy -c /etc/envoy/envoy.yaml --concurrency 1
-    network_mode: host
+    command: >
+      envoy -c /etc/envoy/envoy.yaml --concurrency 1
+  crowdsec:
+    image: crowdsecurity/crowdsec:latest
+    environment:
+      - BOUNCER_KEY_envoy2=thisisabouncerkey
+    volumes:
+      - crowdsec-db:/var/lib/crowdsec/data/
+      - crowdsec-config:/etc/crowdsec/
+      - /var/log/:/logs:ro
+      - ./acquis.yaml:/etc/crowdsec/acquis.yaml
+
+volumes:
+  crowdsec-db:
+  crowdsec-config:

@@ -8,7 +8,7 @@ build-filter:
 
 build-updater:
 	@echo "Building updater..."
-	cd updater && GOOS=wasip1 GOARCH=wasm tinygo build -buildmode=c-shared -o updater.wasm .
+	cd updater && GOOS=wasip1 GOARCH=wasm tinygo build -target=wasip1 -buildmode=c-shared -o updater.wasm .
 
 
 
