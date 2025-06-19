@@ -1,0 +1,13 @@
+version: '3'
+services:
+  envoy:
+    image: envoyproxy/envoy:debug-v1.34-latest
+    #ports:
+    #  - "10000:10000"
+    volumes:
+      - ./envoy.yaml:/etc/envoy/envoy.yaml
+      - ./../filter/filter.wasm:/etc/envoy/crowdsec_filter.wasm
+      - ./../updater/updater.wasm:/etc/envoy/crowdsec_updater.wasm
+#    command: >
+#      envoy -c /etc/envoy/envoy.yaml --concurrency 1
+    network_mode: host

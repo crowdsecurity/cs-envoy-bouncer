@@ -1,0 +1,104 @@
+admin:
+  profile_path: /tmp/envoy.prof
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 9901 }
+bootstrap_extensions:
+- name: envoy.bootstrap.wasm
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.wasm.v3.WasmService
+    singleton: true # Required, or multiple worker will try to fetch data from LAPI and the internal state will be inconsistent
+    config:
+      name: "crowdsec_updater"
+      root_id: "crowdsec_updater"
+      configuration:
+        "@type": type.googleapis.com/google.protobuf.StringValue
+        value: |
+          {
+            "my_config_value": "my_value"
+          }
+      vm_config:
+        runtime: "envoy.wasm.runtime.v8"
+        vm_id: "crowdsec_singleton"
+        code:
+          local:
+            filename: "/etc/envoy/crowdsec_updater.wasm"
+static_resources:
+  listeners:
+  - name: listener_0
+    address:
+      socket_address:
+        address: 0.0.0.0
+        port_value: 10000
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: ingress_http
+          access_log:
+          - name: envoy.access_loggers.stdout
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+          http_filters:
+          - name: envoy.filters.http.wasm
+            typed_config:
+              "@type": type.googleapis.com/udpa.type.v1.TypedStruct
+              type_url: type.googleapis.com/envoy.extensions.filters.http.wasm.v3.Wasm
+              value:
+                config:
+                  name: "crowdsec"
+                  root_id: "crowdsec"
+                  configuration:
+                    "@type": type.googleapis.com/google.protobuf.StringValue
+                    value: |
+                      {
+                        "my_config_value": "my_value"
+                      }
+                  vm_config:
+                    runtime: "envoy.wasm.runtime.v8"
+                    vm_id: "crowdsec_filter"
+                    code:
+                      local:
+                        filename: "/etc/envoy/crowdsec_filter.wasm"
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+          route_config:
+            name: local_route
+            virtual_hosts:
+            - name: local_service
+              domains: ["*"]
+              routes:
+              - match:
+                  prefix: "/"
+                route:
+                  cluster: localhost_cluster
+
+  clusters:
+  - name: localhost_cluster
+    type: STATIC
+    # Comment out the following line to test on v6 networks
+    dns_lookup_family: V4_ONLY
+    load_assignment:
+      cluster_name: openresty
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: 127.0.0.1
+                port_value: 80
+  - name: crowdsec_cluster
+    type: STATIC
+    # Comment out the following line to test on v6 networks
+    dns_lookup_family: V4_ONLY
+    load_assignment:
+      cluster_name: crowdsec_cluster
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: 127.0.0.1
+                port_value: 8081
+
