@@ -2,14 +2,18 @@ version: '3'
 services:
   envoy:
     image: envoyproxy/envoy:debug-v1.34-latest
+    environment:
+      - ENVOY_UID=0
+      - ENVOY_GID=0
+    user: root
     depends_on:
       - crowdsec
     ports:
       - "10000:10000"
     volumes:
       - ./envoy.yaml:/etc/envoy/envoy.yaml
-      - ./../filter/filter.wasm:/etc/envoy/crowdsec_filter.wasm
-      - ./../updater/updater.wasm:/etc/envoy/crowdsec_updater.wasm
+      - ./../rust_filter/target/wasm32-wasip1/debug/crowdsec_filter.wasm:/etc/envoy/crowdsec_filter.wasm
+      - ./../rust_updater/target/wasm32-wasip1/debug/crowdsec_updater.wasm:/etc/envoy/crowdsec_updater.wasm
     command: >
       envoy -c /etc/envoy/envoy.yaml --concurrency 1
   crowdsec:

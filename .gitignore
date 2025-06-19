@@ -33,3 +33,6 @@ go.work.sum
 
 filter/filter.wasm
 updater/updater.wasm
+
+/target/
+Cargo.lock
