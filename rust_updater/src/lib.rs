@@ -29,11 +29,12 @@ struct Decision {
 struct CrowdsecUpdater {
     bans: HashSet<String>,
     queue_id: Option<u32>,
+    is_startup: bool,
 }
 
 impl Default for CrowdsecUpdater {
     fn default() -> Self {
-        Self { bans: HashSet::new(), queue_id: None }
+        Self { bans: HashSet::new(), queue_id: None, is_startup: true }
     }
 }
 
@@ -53,13 +54,20 @@ impl RootContext for CrowdsecUpdater {
     fn on_tick(&mut self) {
 	self.queue_id = proxy_wasm::hostcalls::resolve_shared_queue("crowdsec_filter", "crowdsec_ban_update").ok().flatten();
 
+    let path = if self.is_startup {
+        "/v1/decisions/stream?startup=true"
+    } else {
+        "/v1/decisions/stream"
+    };
+    self.is_startup = false;
+
         let headers = vec![
             (":method", "GET"),
-            (":path", "/v1/decisions/stream?startup=true"),
+            (":path", path),
             (":authority", "crowdsec"),
             ("x-api-key", "thisisabouncerkey"),
         ];
-        info!("Askin the crowdsec LAPI for decisions");
+        info!("Askin the crowdsec LAPI for decisions {path}");
         self.dispatch_http_call(
             "crowdsec_cluster",
             headers,
