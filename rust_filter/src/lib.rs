@@ -1,17 +1,37 @@
 use proxy_wasm::traits::*;
 use proxy_wasm::types::*;
-//use serde::Deserialize;
+use serde::Deserialize;
 //use serde::Serialize;
 use std::collections::{HashSet};
 use std::time::Duration;
-//use std::cell::RefCell;
-//use std::rc::Rc;
+use std::rc::Rc;
+use std::cell::RefCell;
+
+// We use Rc<RefCell<HashSet<String>>> for the ban list to share mutable state
+// between the root context and all HTTP contexts. This is necessary because
+// the proxy-wasm SDK requires all subcontexts (like HttpContext) to be 'static,
+// meaning they cannot hold non-static references to data owned by the root context.
+// See: https://github.com/proxy-wasm/proxy-wasm-rust-sdk/issues/191
+//
+// Using Rc<RefCell<...>> allows us to efficiently share and mutate the ban list
+// across contexts without unnecessary copying, while satisfying the SDK's trait
+// requirements and Rust's safety guarantees.
+//
+// Shared ban list type
+type SharedBans = Rc<RefCell<HashSet<String>>>;
+
+#[derive(Deserialize, Debug)]
+struct BanMessage {
+    ip: String,
+    remediation: String,
+    expiration: String,
+}
 
 struct CrowdsecFilter {
     queue_id: Option<u32>,
     queue_read_count: u32,
     has_sent_name: bool,
-    // bans: HashSet<String>
+    bans: SharedBans,
 }
 
 impl Default for CrowdsecFilter {
@@ -20,7 +40,7 @@ impl Default for CrowdsecFilter {
             queue_id: None,
             queue_read_count: 0,
             has_sent_name: false,
-            // bans: HashSet::new()
+            bans: Rc::new(RefCell::new(HashSet::new())),
         }
     }
 }
@@ -57,7 +77,10 @@ impl RootContext for CrowdsecFilter {
     }
 
     fn create_http_context(&self, context_id: u32) -> Option<Box<dyn HttpContext>> {
-        Some(Box::new(CrowdsecFilterHttp { context_id }))
+        Some(Box::new(CrowdsecFilterHttp {
+            context_id,
+            bans: Rc::clone(&self.bans),
+        }))
     }
 
     fn on_queue_ready(&mut self, queue_id: u32) {
@@ -65,6 +88,10 @@ impl RootContext for CrowdsecFilter {
         match proxy_wasm::hostcalls::dequeue_shared_queue(queue_id) {
             Ok(Some(payload)) => {
                 proxy_wasm::hostcalls::log(LogLevel::Info, &format!("Dequeued from queue: {:?}", String::from_utf8_lossy(&payload))).ok();
+                // Parse and add to bans
+                if let Ok(msg) = serde_json::from_slice::<BanMessage>(&payload) {
+                    self.bans.borrow_mut().insert(msg.ip);
+                }
                 self.queue_read_count += 1;
             }
             Ok(None) => {
@@ -79,6 +106,7 @@ impl RootContext for CrowdsecFilter {
 
 struct CrowdsecFilterHttp {
     context_id: u32,
+    bans: SharedBans,
 }
 
 impl Context for CrowdsecFilterHttp {}
@@ -91,6 +119,17 @@ impl HttpContext for CrowdsecFilterHttp {
             ),
         ).ok();
 
+        // Extract IP from headers
+        if let Some(ip) = self.get_http_request_header("x-forwarded-for") {
+            if self.bans.borrow().contains(&ip) {
+                self.send_http_response(
+                    403,
+                    vec![("content-type", "text/plain")],
+                    Some(b"Forbidden: Your IP is banned.\n"),
+                );
+                return Action::Pause;
+            }
+        }
         Action::Continue
     }
 
