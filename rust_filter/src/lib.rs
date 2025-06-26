@@ -88,9 +88,30 @@ impl RootContext for CrowdsecFilter {
         match proxy_wasm::hostcalls::dequeue_shared_queue(queue_id) {
             Ok(Some(payload)) => {
                 proxy_wasm::hostcalls::log(LogLevel::Info, &format!("Dequeued from queue: {:?}", String::from_utf8_lossy(&payload))).ok();
-                // Parse and add to bans
-                if let Ok(msg) = serde_json::from_slice::<BanMessage>(&payload) {
-                    self.bans.borrow_mut().insert(msg.ip);
+                // Parse as a batch (JSON array)
+                let result = serde_json::from_slice::<Vec<BanMessage>>(&payload);
+                match result {
+                    Ok(batch) => {
+                        let mut bans = self.bans.borrow_mut();
+                        for msg in batch {
+                            if msg.remediation == "unban" {
+                                bans.remove(&msg.ip);
+                            } else {
+                                bans.insert(msg.ip);
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // Fallback: try single message for backward compatibility
+                        if let Ok(msg) = serde_json::from_slice::<BanMessage>(&payload) {
+                            let mut bans = self.bans.borrow_mut();
+                            if msg.remediation == "unban" {
+                                bans.remove(&msg.ip);
+                            } else {
+                                bans.insert(msg.ip);
+                            }
+                        }
+                    }
                 }
                 self.queue_read_count += 1;
             }
