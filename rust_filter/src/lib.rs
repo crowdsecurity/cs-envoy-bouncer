@@ -64,7 +64,7 @@ impl RootContext for CrowdsecFilter {
             Ok(queue_id) => {
                 proxy_wasm::hostcalls::log(
                     LogLevel::Debug,
-                    &format!("Registered shared queue: {}", queue_id),
+                    &format!("Registered shared queue: {}", worker_queue_name),
                 )
                 .ok();
                 true
@@ -72,7 +72,10 @@ impl RootContext for CrowdsecFilter {
             Err(e) => {
                 proxy_wasm::hostcalls::log(
                     LogLevel::Error,
-                    &format!("Failed to register shared queue: {:?}", e),
+                    &format!(
+                        "Failed to register shared queue {}: {:?}",
+                        worker_queue_name, e
+                    ),
                 )
                 .ok();
                 false
@@ -93,7 +96,7 @@ impl RootContext for CrowdsecFilter {
         }
         //FIXME: put the queue name in a common lib between the updater and the worker
         let queue_name = "crowdsec_worker_names";
-        match proxy_wasm::hostcalls::resolve_shared_queue(&"crowdsec", &queue_name) {
+        match proxy_wasm::hostcalls::resolve_shared_queue(&"crowdsec_singleton", &queue_name) {
             Ok(Some(queue_id)) => updater_queue_id = queue_id,
             Ok(None) => {
                 proxy_wasm::hostcalls::log(LogLevel::Error, "Shared queue not found").ok();
@@ -111,11 +114,14 @@ impl RootContext for CrowdsecFilter {
 
         match proxy_wasm::hostcalls::enqueue_shared_queue(
             updater_queue_id,
-            Some(self.worker_uuid.as_bytes()),
+            Some(self.worker_uuid.to_string().as_bytes()),
         ) {
             Ok(()) => {
-                proxy_wasm::hostcalls::log(LogLevel::Info, "Successfully enqueued worker UUID")
-                    .ok();
+                proxy_wasm::hostcalls::log(
+                    LogLevel::Info,
+                    &format!("Successfully enqueued worker UUID: {}", self.worker_uuid),
+                )
+                .ok();
             }
             Err(e) => {
                 proxy_wasm::hostcalls::log(

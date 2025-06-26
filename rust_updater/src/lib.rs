@@ -82,34 +82,50 @@ impl RootContext for CrowdsecUpdater {
 
     fn on_queue_ready(&mut self, _queue_id: u32) {
         match proxy_wasm::hostcalls::dequeue_shared_queue(_queue_id) {
-            Ok(Some(worker_uuid)) => {
-                let worker_uuid_str = String::from_utf8(worker_uuid).unwrap_or_default();
+            Ok(Some(worker_uuid)) => match String::from_utf8(worker_uuid) {
+                Ok(worker_uuid_str) => {
+                    proxy_wasm::hostcalls::log(
+                        LogLevel::Info,
+                        &format!("Worker UUID: {}", worker_uuid_str),
+                    )
+                    .ok();
+                    let worker_queue_name = format!("crowdsec_worker_{}", worker_uuid_str);
 
-                let worker_queue_name = format!("crowdsec_worker_{}", worker_uuid_str);
-
-                match proxy_wasm::hostcalls::resolve_shared_queue("crowdsec", &worker_queue_name) {
-                    Ok(Some(queue_id)) => {
-                        self.worker_queues_ids.push(queue_id);
-                    }
-                    Ok(None) => {
-                        proxy_wasm::hostcalls::log(
-                            LogLevel::Error,
-                            &format!("Worker queue not found: {}", worker_queue_name),
-                        )
-                        .ok();
-                    }
-                    Err(e) => {
-                        proxy_wasm::hostcalls::log(
-                            LogLevel::Error,
-                            &format!(
-                                "Failed to resolve worker queue {}: {:?}",
-                                worker_queue_name, e
-                            ),
-                        )
-                        .ok();
+                    match proxy_wasm::hostcalls::resolve_shared_queue(
+                        "crowdsec_filter",
+                        &worker_queue_name,
+                    ) {
+                        Ok(Some(queue_id)) => {
+                            self.worker_queues_ids.push(queue_id);
+                        }
+                        Ok(None) => {
+                            proxy_wasm::hostcalls::log(
+                                LogLevel::Error,
+                                &format!("Worker queue not found: {}", worker_queue_name),
+                            )
+                            .ok();
+                        }
+                        Err(e) => {
+                            proxy_wasm::hostcalls::log(
+                                LogLevel::Error,
+                                &format!(
+                                    "Failed to resolve worker queue {}: {:?}",
+                                    worker_queue_name, e
+                                ),
+                            )
+                            .ok();
+                        }
                     }
                 }
-            }
+                Err(e) => {
+                    proxy_wasm::hostcalls::log(
+                        LogLevel::Error,
+                        &format!("Invalid UTF-8 in worker UUID: {:?}", e),
+                    )
+                    .ok();
+                    return;
+                }
+            },
             Ok(None) => {
                 proxy_wasm::hostcalls::log(LogLevel::Error, "Empty read from worker names queue")
                     .ok();
