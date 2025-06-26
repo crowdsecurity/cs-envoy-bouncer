@@ -6,6 +6,8 @@ use std::collections::{HashSet};
 use std::time::Duration;
 use log::info;
 
+const MAX_BATCH_SIZE: usize = 12 * 1024; // 12KB, safe for ABI, make configurable if needed
+
 #[derive(Deserialize, Debug, Clone)]
 struct StreamResponse {
     new: Vec<Decision>,
@@ -87,32 +89,42 @@ impl Context for CrowdsecUpdater {
         let parsed = match parsed {
             Ok(p) => p,
             Err(e) => {
+                // Print the full JSON body for debugging
                 proxy_wasm::hostcalls::log(LogLevel::Error, &format!("JSON parse error: {:?}", e)).ok();
+                proxy_wasm::hostcalls::log(LogLevel::Error, &format!("Full JSON body: {}", String::from_utf8_lossy(&body))).ok();
                 return;
             }
         };
 
+        let mut to_send = Vec::new();
+
         // Handle deletions
         for dec in parsed.deleted.iter() {
             self.bans.remove(&dec.value);
+            let msg = BanMessage {
+                ip: &dec.value,
+                remediation: "unban",
+                expiration: "",
+            };
+            to_send.push(msg);
         }
 
         // Handle new bans
         for dec in parsed.new.iter() {
-	    let remediation = dec.remediation.as_deref().unwrap_or("ban");
-	    let expiration = dec.expiration.as_deref().unwrap_or("");
-	    let msg = BanMessage {
-		ip: &dec.value,
-		remediation,
-		expiration,
-	    };
-	    if let Ok(json_string) = serde_json::to_string(&msg) {
-		if let Some(queue_id) = self.queue_id {
-		    info!("Enqueuing decisions {}", json_string);
-		    let _ = proxy_wasm::hostcalls::enqueue_shared_queue(queue_id, Some(&json_string.as_bytes()));
-		}
-	    }
-	}
+            let remediation = dec.remediation.as_deref().unwrap_or("ban");
+            let expiration = dec.expiration.as_deref().unwrap_or("");
+            let msg = BanMessage {
+                ip: &dec.value,
+                remediation,
+                expiration,
+            };
+            to_send.push(msg);
+        }
+
+        if let Some(queue_id) = self.queue_id {
+            self.send_batched(queue_id, &to_send);
+        }
+
         proxy_wasm::hostcalls::log(
             LogLevel::Info,
             &format!(
@@ -123,6 +135,31 @@ impl Context for CrowdsecUpdater {
             ),
         )
         .ok();
+    }
+}
+
+impl CrowdsecUpdater {
+    fn send_batched(&self, queue_id: u32, messages: &[BanMessage]) {
+        let mut batch = Vec::new();
+        let mut batch_size = 0;
+
+        for msg in messages {
+            if let Ok(json) = serde_json::to_string(msg) {
+                let json_len = json.len();
+                if batch_size + json_len > MAX_BATCH_SIZE && !batch.is_empty() {
+                    let batch_json = format!("[{}]", batch.join(","));
+                    let _ = proxy_wasm::hostcalls::enqueue_shared_queue(queue_id, Some(batch_json.as_bytes()));
+                    batch.clear();
+                    batch_size = 0;
+                }
+                batch.push(json);
+                batch_size += json_len;
+            }
+        }
+        if !batch.is_empty() {
+            let batch_json = format!("[{}]", batch.join(","));
+            let _ = proxy_wasm::hostcalls::enqueue_shared_queue(queue_id, Some(batch_json.as_bytes()));
+        }
     }
 }
 
