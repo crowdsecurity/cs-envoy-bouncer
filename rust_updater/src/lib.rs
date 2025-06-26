@@ -5,12 +5,29 @@ use serde::Serialize;
 use std::collections::{HashSet};
 use std::time::Duration;
 use log::info;
+use flexbuffers;
 
-const MAX_BATCH_SIZE: usize = 12 * 1024; // 12KB, safe for ABI, make configurable if needed
+const MAX_BATCH_BYTES: usize = 12 * 1024; // 12KB, safe for ABI, make configurable if needed
+const BATCH_SIZE: usize = 1000; // We should make it configurable 
+
+
+// this is a workaround for the fact that the json is sometimes null
+// and we need to make sure that the vec is empty if the json is null
+// example: {"deleted":null,"new":null}
+// instead of {"deleted":[],"new":[]}
+fn null_to_empty_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    Ok(Option::deserialize(deserializer)?.unwrap_or_default())
+}
 
 #[derive(Deserialize, Debug, Clone)]
 struct StreamResponse {
+    #[serde(default, deserialize_with = "null_to_empty_vec")]
     new: Vec<Decision>,
+    #[serde(default, deserialize_with = "null_to_empty_vec")]
     deleted: Vec<Decision>,
 }
 
@@ -140,25 +157,21 @@ impl Context for CrowdsecUpdater {
 
 impl CrowdsecUpdater {
     fn send_batched(&self, queue_id: u32, messages: &[BanMessage]) {
-        let mut batch = Vec::new();
-        let mut batch_size = 0;
-
-        for msg in messages {
-            if let Ok(json) = serde_json::to_string(msg) {
-                let json_len = json.len();
-                if batch_size + json_len > MAX_BATCH_SIZE && !batch.is_empty() {
-                    let batch_json = format!("[{}]", batch.join(","));
-                    let _ = proxy_wasm::hostcalls::enqueue_shared_queue(queue_id, Some(batch_json.as_bytes()));
-                    batch.clear();
-                    batch_size = 0;
-                }
-                batch.push(json);
-                batch_size += json_len;
+        let mut batch_count = 0;
+        for chunk in messages.chunks(BATCH_SIZE) {
+            let mut s = flexbuffers::FlexbufferSerializer::new();
+            if let Err(e) = chunk.serialize(&mut s) {
+                proxy_wasm::hostcalls::log(LogLevel::Error, &format!("Flexbuffers serialization error: {:?}", e)).ok();
+                continue;
             }
-        }
-        if !batch.is_empty() {
-            let batch_json = format!("[{}]", batch.join(","));
-            let _ = proxy_wasm::hostcalls::enqueue_shared_queue(queue_id, Some(batch_json.as_bytes()));
+            let data = s.view();
+            if data.len() > MAX_BATCH_BYTES {
+                proxy_wasm::hostcalls::log(LogLevel::Warn, &format!("Batch {}: {} messages, {} bytes (exceeds 16KB!)", batch_count + 1, chunk.len(), data.len())).ok();
+            } else {
+                proxy_wasm::hostcalls::log(LogLevel::Info, &format!("Batch {}: {} messages, {} bytes", batch_count + 1, chunk.len(), data.len())).ok();
+            }
+            let _ = proxy_wasm::hostcalls::enqueue_shared_queue(queue_id, Some(data));
+            batch_count += 1;
         }
     }
 }

@@ -1,11 +1,12 @@
 use proxy_wasm::traits::*;
 use proxy_wasm::types::*;
 use serde::Deserialize;
-//use serde::Serialize;
+use serde::Serialize;
 use std::collections::{HashSet};
 use std::time::Duration;
 use std::rc::Rc;
 use std::cell::RefCell;
+use flexbuffers;
 
 // We use Rc<RefCell<HashSet<String>>> for the ban list to share mutable state
 // between the root context and all HTTP contexts. This is necessary because
@@ -20,7 +21,7 @@ use std::cell::RefCell;
 // Shared ban list type
 type SharedBans = Rc<RefCell<HashSet<String>>>;
 
-#[derive(Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 struct BanMessage {
     ip: String,
     remediation: String,
@@ -87,30 +88,27 @@ impl RootContext for CrowdsecFilter {
         proxy_wasm::hostcalls::log(LogLevel::Info, &format!("Shared queue {queue_id} is ready")).ok();
         match proxy_wasm::hostcalls::dequeue_shared_queue(queue_id) {
             Ok(Some(payload)) => {
-                proxy_wasm::hostcalls::log(LogLevel::Info, &format!("Dequeued from queue: {:?}", String::from_utf8_lossy(&payload))).ok();
-                // Parse as a batch (JSON array)
-                let result = serde_json::from_slice::<Vec<BanMessage>>(&payload);
-                match result {
-                    Ok(batch) => {
-                        let mut bans = self.bans.borrow_mut();
-                        for msg in batch {
-                            if msg.remediation == "unban" {
-                                bans.remove(&msg.ip);
-                            } else {
-                                bans.insert(msg.ip);
-                            }
+                // Do not log the raw payload, just the number of decisions
+                // Try to parse as a batch (flexbuffers vector)
+                let batch_result = flexbuffers::from_slice::<Vec<BanMessage>>(&payload);
+                if let Ok(batch) = batch_result {
+                    proxy_wasm::hostcalls::log(LogLevel::Info, &format!("Dequeued batch with {} decisions", batch.len())).ok();
+                    let mut bans = self.bans.borrow_mut();
+                    for msg in batch {
+                        if msg.remediation == "unban" {
+                            bans.remove(&msg.ip);
+                        } else {
+                            bans.insert(msg.ip);
                         }
                     }
-                    Err(_) => {
-                        // Fallback: try single message for backward compatibility
-                        if let Ok(msg) = serde_json::from_slice::<BanMessage>(&payload) {
-                            let mut bans = self.bans.borrow_mut();
-                            if msg.remediation == "unban" {
-                                bans.remove(&msg.ip);
-                            } else {
-                                bans.insert(msg.ip);
-                            }
-                        }
+                } else if let Ok(msg) = flexbuffers::from_slice::<BanMessage>(&payload) {
+                    proxy_wasm::hostcalls::log(LogLevel::Info, "Dequeued single decision").ok();
+                    // Fallback: try single message for backward compatibility
+                    let mut bans = self.bans.borrow_mut();
+                    if msg.remediation == "unban" {
+                        bans.remove(&msg.ip);
+                    } else {
+                        bans.insert(msg.ip);
                     }
                 }
                 self.queue_read_count += 1;
