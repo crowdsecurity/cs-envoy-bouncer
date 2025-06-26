@@ -1,15 +1,14 @@
+use flexbuffers;
+use log::info;
 use proxy_wasm::traits::*;
 use proxy_wasm::types::*;
 use serde::Deserialize;
 use serde::Serialize;
-use std::collections::{HashSet};
+use std::collections::HashSet;
 use std::time::Duration;
-use log::info;
-use flexbuffers;
 
 const MAX_BATCH_BYTES: usize = 12 * 1024; // 12KB, safe for ABI, make configurable if needed
-const BATCH_SIZE: usize = 1000; // We should make it configurable 
-
+const BATCH_SIZE: usize = 1000; // We should make it configurable
 
 // this is a workaround for the fact that the json is sometimes null
 // and we need to make sure that the vec is empty if the json is null
@@ -31,6 +30,7 @@ struct StreamResponse {
     deleted: Vec<Decision>,
 }
 
+//FIXME: move this to a common crate
 #[derive(Serialize)]
 struct BanMessage<'a> {
     ip: &'a str,
@@ -38,6 +38,7 @@ struct BanMessage<'a> {
     expiration: &'a str,
 }
 
+//TODO: should this be moved to another crate ?
 #[derive(Deserialize, Debug, Clone)]
 struct Decision {
     value: String,
@@ -47,15 +48,23 @@ struct Decision {
 
 struct CrowdsecUpdater {
     bans: HashSet<String>,
-    queue_id: Option<u32>,
     is_startup: bool,
+    worker_names_queue_id: Option<u32>,
+    worker_queues_ids: Vec<u32>,
 }
 
 impl Default for CrowdsecUpdater {
     fn default() -> Self {
-        Self { bans: HashSet::new(), queue_id: None, is_startup: true }
+        Self {
+            bans: HashSet::new(),
+            worker_names_queue_id: None,
+            is_startup: true,
+            worker_queues_ids: vec![],
+        }
     }
 }
+
+const STR_WORKER_NAMES_QUEUE: &str = "crowdsec_worker_names";
 
 proxy_wasm::main! {{
     proxy_wasm::set_log_level(LogLevel::Trace);
@@ -64,21 +73,69 @@ proxy_wasm::main! {{
 
 impl RootContext for CrowdsecUpdater {
     fn on_vm_start(&mut self, _: usize) -> bool {
-        let _queue_name = "crowdsec_ban_update";
-//        self.queue_id = proxy_wasm::hostcalls::register_shared_queue(queue_name).ok();
+        self.worker_names_queue_id =
+            proxy_wasm::hostcalls::register_shared_queue(&STR_WORKER_NAMES_QUEUE).ok();
         self.set_tick_period(Duration::from_secs(10));
         info!("Updater started!");
         true
     }
-    fn on_tick(&mut self) {
-	self.queue_id = proxy_wasm::hostcalls::resolve_shared_queue("crowdsec_filter", "crowdsec_ban_update").ok().flatten();
 
-    let path = if self.is_startup {
-        "/v1/decisions/stream?startup=true"
-    } else {
-        "/v1/decisions/stream"
-    };
-    self.is_startup = false;
+    fn on_queue_ready(&mut self, _queue_id: u32) {
+        match proxy_wasm::hostcalls::dequeue_shared_queue(_queue_id) {
+            Ok(Some(worker_uuid)) => {
+                let worker_uuid_str = String::from_utf8(worker_uuid).unwrap_or_default();
+
+                let worker_queue_name = format!("crowdsec_worker_{}", worker_uuid_str);
+
+                match proxy_wasm::hostcalls::resolve_shared_queue("crowdsec", &worker_queue_name) {
+                    Ok(Some(queue_id)) => {
+                        self.worker_queues_ids.push(queue_id);
+                    }
+                    Ok(None) => {
+                        proxy_wasm::hostcalls::log(
+                            LogLevel::Error,
+                            &format!("Worker queue not found: {}", worker_queue_name),
+                        )
+                        .ok();
+                    }
+                    Err(e) => {
+                        proxy_wasm::hostcalls::log(
+                            LogLevel::Error,
+                            &format!(
+                                "Failed to resolve worker queue {}: {:?}",
+                                worker_queue_name, e
+                            ),
+                        )
+                        .ok();
+                    }
+                }
+            }
+            Ok(None) => {
+                proxy_wasm::hostcalls::log(LogLevel::Error, "Empty read from worker names queue")
+                    .ok();
+            }
+            Err(e) => {
+                proxy_wasm::hostcalls::log(
+                    LogLevel::Error,
+                    &format!("Failed to dequeue worker names from shared queue: {:?}", e),
+                )
+                .ok();
+            }
+        }
+    }
+
+    fn on_tick(&mut self) {
+        if self.worker_queues_ids.len() == 0 {
+            proxy_wasm::hostcalls::log(LogLevel::Error, "Worker queues not initialized").ok();
+            return;
+        }
+
+        let path = if self.is_startup {
+            "/v1/decisions/stream?startup=true"
+        } else {
+            "/v1/decisions/stream"
+        };
+        self.is_startup = false;
 
         let headers = vec![
             (":method", "GET"),
@@ -93,22 +150,36 @@ impl RootContext for CrowdsecUpdater {
             None,
             vec![],
             Duration::from_secs(5),
-        ).ok();
+        )
+        .ok();
     }
 }
 
 impl Context for CrowdsecUpdater {
-    fn on_http_call_response(&mut self, _token_id: u32, _num_headers: usize, body_size: usize, _num_trailers: usize) {
+    fn on_http_call_response(
+        &mut self,
+        _token_id: u32,
+        _num_headers: usize,
+        body_size: usize,
+        _num_trailers: usize,
+    ) {
         info!("Parsing the decisions");
-        let body = self.get_http_call_response_body(0, body_size).unwrap_or_default();
+        let body = self
+            .get_http_call_response_body(0, body_size)
+            .unwrap_or_default();
 
         let parsed: serde_json::Result<StreamResponse> = serde_json::from_slice(&body);
         let parsed = match parsed {
             Ok(p) => p,
             Err(e) => {
                 // Print the full JSON body for debugging
-                proxy_wasm::hostcalls::log(LogLevel::Error, &format!("JSON parse error: {:?}", e)).ok();
-                proxy_wasm::hostcalls::log(LogLevel::Error, &format!("Full JSON body: {}", String::from_utf8_lossy(&body))).ok();
+                proxy_wasm::hostcalls::log(LogLevel::Error, &format!("JSON parse error: {:?}", e))
+                    .ok();
+                proxy_wasm::hostcalls::log(
+                    LogLevel::Error,
+                    &format!("Full JSON body: {}", String::from_utf8_lossy(&body)),
+                )
+                .ok();
                 return;
             }
         };
@@ -138,9 +209,7 @@ impl Context for CrowdsecUpdater {
             to_send.push(msg);
         }
 
-        if let Some(queue_id) = self.queue_id {
-            self.send_batched(queue_id, &to_send);
-        }
+        self.send_batched(&to_send);
 
         proxy_wasm::hostcalls::log(
             LogLevel::Info,
@@ -156,23 +225,52 @@ impl Context for CrowdsecUpdater {
 }
 
 impl CrowdsecUpdater {
-    fn send_batched(&self, queue_id: u32, messages: &[BanMessage]) {
-        let mut batch_count = 0;
+    fn send_batched(&self, messages: &[BanMessage]) {
         for chunk in messages.chunks(BATCH_SIZE) {
-            let mut s = flexbuffers::FlexbufferSerializer::new();
-            if let Err(e) = chunk.serialize(&mut s) {
-                proxy_wasm::hostcalls::log(LogLevel::Error, &format!("Flexbuffers serialization error: {:?}", e)).ok();
-                continue;
+            self.broadcast_decisions(chunk);
+        }
+    }
+
+    fn broadcast_decisions(&self, decisions: &[BanMessage]) {
+        let mut s = flexbuffers::FlexbufferSerializer::new();
+        if let Err(e) = decisions.serialize(&mut s) {
+            proxy_wasm::hostcalls::log(
+                LogLevel::Error,
+                &format!("Flexbuffers serialization error: {:?}", e),
+            )
+            .ok();
+        }
+        let data = s.view();
+        if data.len() > MAX_BATCH_BYTES {
+            proxy_wasm::hostcalls::log(
+                LogLevel::Warn,
+                &format!(
+                    "Batch: {} messages, {} bytes (exceeds 12KB!)",
+                    decisions.len(),
+                    data.len()
+                ),
+            )
+            .ok();
+        } else {
+            proxy_wasm::hostcalls::log(
+                LogLevel::Info,
+                &format!("Batch: {} messages, {} bytes", decisions.len(), data.len()),
+            )
+            .ok();
+        }
+
+        for queue_id in &self.worker_queues_ids {
+            match proxy_wasm::hostcalls::enqueue_shared_queue(*queue_id, Some(data)) {
+                Ok(_) => {}
+                Err(e) => {
+                    proxy_wasm::hostcalls::log(
+                        LogLevel::Error,
+                        &format!("Failed to enqueue decision: {:?}", e),
+                    )
+                    .ok();
+                    continue;
+                }
             }
-            let data = s.view();
-            if data.len() > MAX_BATCH_BYTES {
-                proxy_wasm::hostcalls::log(LogLevel::Warn, &format!("Batch {}: {} messages, {} bytes (exceeds 16KB!)", batch_count + 1, chunk.len(), data.len())).ok();
-            } else {
-                proxy_wasm::hostcalls::log(LogLevel::Info, &format!("Batch {}: {} messages, {} bytes", batch_count + 1, chunk.len(), data.len())).ok();
-            }
-            let _ = proxy_wasm::hostcalls::enqueue_shared_queue(queue_id, Some(data));
-            batch_count += 1;
         }
     }
 }
-

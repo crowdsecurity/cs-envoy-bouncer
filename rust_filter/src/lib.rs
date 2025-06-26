@@ -1,12 +1,12 @@
+use flexbuffers;
 use proxy_wasm::traits::*;
 use proxy_wasm::types::*;
 use serde::Deserialize;
 use serde::Serialize;
-use std::collections::{HashSet};
-use std::time::Duration;
-use std::rc::Rc;
 use std::cell::RefCell;
-use flexbuffers;
+use std::collections::HashSet;
+use std::rc::Rc;
+use std::time::Duration;
 
 // We use Rc<RefCell<HashSet<String>>> for the ban list to share mutable state
 // between the root context and all HTTP contexts. This is necessary because
@@ -29,19 +29,18 @@ struct BanMessage {
 }
 
 struct CrowdsecFilter {
-    queue_id: Option<u32>,
-    queue_read_count: u32,
     has_sent_name: bool,
     bans: SharedBans,
+    worker_uuid: uuid::Uuid,
+    // bans: HashSet<String>
 }
 
 impl Default for CrowdsecFilter {
     fn default() -> Self {
         Self {
-            queue_id: None,
-            queue_read_count: 0,
             has_sent_name: false,
             bans: Rc::new(RefCell::new(HashSet::new())),
+            worker_uuid: uuid::Uuid::new_v4(),
         }
     }
 }
@@ -57,22 +56,75 @@ impl Context for CrowdsecFilter {}
 impl RootContext for CrowdsecFilter {
     fn on_vm_start(&mut self, _: usize) -> bool {
         proxy_wasm::hostcalls::log(LogLevel::Info, "Crowdsec filter VM start").ok();
-        self.set_tick_period(Duration::from_millis(2000));
-        true
+        self.set_tick_period(Duration::from_millis(2000)); //To send the updater our uuid so we can receive decisions
+
+        let worker_queue_name = format!("crowdsec_worker_{}", self.worker_uuid);
+
+        match proxy_wasm::hostcalls::register_shared_queue(&worker_queue_name) {
+            Ok(queue_id) => {
+                proxy_wasm::hostcalls::log(
+                    LogLevel::Debug,
+                    &format!("Registered shared queue: {}", queue_id),
+                )
+                .ok();
+                true
+            }
+            Err(e) => {
+                proxy_wasm::hostcalls::log(
+                    LogLevel::Error,
+                    &format!("Failed to register shared queue: {:?}", e),
+                )
+                .ok();
+                false
+            }
+        }
     }
 
     fn get_type(&self) -> Option<ContextType> {
         Some(ContextType::HttpContext)
     }
-    
+
     fn on_tick(&mut self) {
-        proxy_wasm::hostcalls::log(LogLevel::Info, &format!("queue read count: {}", self.queue_read_count)).ok();
+        //TODO: check if this we still have to have fake dependencies by waiting for for time before the updater is up
+        let updater_queue_id;
 
         if self.has_sent_name {
             return;
         }
-        let queue_name = "crowdsec_ban_update";
-        self.queue_id = proxy_wasm::hostcalls::register_shared_queue(queue_name).ok();
+        //FIXME: put the queue name in a common lib between the updater and the worker
+        let queue_name = "crowdsec_worker_names";
+        match proxy_wasm::hostcalls::resolve_shared_queue(&"crowdsec", &queue_name) {
+            Ok(Some(queue_id)) => updater_queue_id = queue_id,
+            Ok(None) => {
+                proxy_wasm::hostcalls::log(LogLevel::Error, "Shared queue not found").ok();
+                return;
+            }
+            Err(e) => {
+                proxy_wasm::hostcalls::log(
+                    LogLevel::Error,
+                    &format!("Failed to resolve shared queue: {:?}", e),
+                )
+                .ok();
+                return;
+            }
+        }
+
+        match proxy_wasm::hostcalls::enqueue_shared_queue(
+            updater_queue_id,
+            Some(self.worker_uuid.as_bytes()),
+        ) {
+            Ok(()) => {
+                proxy_wasm::hostcalls::log(LogLevel::Info, "Successfully enqueued worker UUID")
+                    .ok();
+            }
+            Err(e) => {
+                proxy_wasm::hostcalls::log(
+                    LogLevel::Error,
+                    &format!("Failed to enqueue worker UUID: {:?}", e),
+                )
+                .ok();
+            }
+        }
 
         self.has_sent_name = true;
     }
@@ -85,14 +137,19 @@ impl RootContext for CrowdsecFilter {
     }
 
     fn on_queue_ready(&mut self, queue_id: u32) {
-        proxy_wasm::hostcalls::log(LogLevel::Info, &format!("Shared queue {queue_id} is ready")).ok();
+        proxy_wasm::hostcalls::log(LogLevel::Info, &format!("Shared queue {queue_id} is ready"))
+            .ok();
         match proxy_wasm::hostcalls::dequeue_shared_queue(queue_id) {
             Ok(Some(payload)) => {
                 // Do not log the raw payload, just the number of decisions
                 // Try to parse as a batch (flexbuffers vector)
                 let batch_result = flexbuffers::from_slice::<Vec<BanMessage>>(&payload);
                 if let Ok(batch) = batch_result {
-                    proxy_wasm::hostcalls::log(LogLevel::Info, &format!("Dequeued batch with {} decisions", batch.len())).ok();
+                    proxy_wasm::hostcalls::log(
+                        LogLevel::Info,
+                        &format!("Dequeued batch with {} decisions", batch.len()),
+                    )
+                    .ok();
                     let mut bans = self.bans.borrow_mut();
                     for msg in batch {
                         if msg.remediation == "unban" {
@@ -111,13 +168,16 @@ impl RootContext for CrowdsecFilter {
                         bans.insert(msg.ip);
                     }
                 }
-                self.queue_read_count += 1;
             }
             Ok(None) => {
                 proxy_wasm::hostcalls::log(LogLevel::Debug, "No data in shared queue").ok();
             }
             Err(e) => {
-                proxy_wasm::hostcalls::log(LogLevel::Error, &format!("Failed to dequeue shared queue: {:?}", e)).ok();
+                proxy_wasm::hostcalls::log(
+                    LogLevel::Error,
+                    &format!("Failed to dequeue shared queue: {:?}", e),
+                )
+                .ok();
             }
         }
     }
@@ -136,7 +196,8 @@ impl HttpContext for CrowdsecFilterHttp {
             &format!(
                 "Received {num_headers} HTTP request headers | end_of_stream: {end_of_stream}"
             ),
-        ).ok();
+        )
+        .ok();
 
         // Extract IP from headers
         if let Some(ip) = self.get_http_request_header("x-forwarded-for") {
@@ -158,8 +219,8 @@ impl HttpContext for CrowdsecFilterHttp {
             &format!(
                 "Received HTTP request body of size {body_size} | end_of_stream: {end_of_stream}"
             ),
-        ).ok();
+        )
+        .ok();
         Action::Continue
     }
-
 }
