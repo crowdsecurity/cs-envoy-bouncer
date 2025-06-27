@@ -9,6 +9,7 @@ crate-type = ["cdylib"]
 [dependencies]
 proxy-wasm = "0.2.3"
 serde_json = "1"
+serde_yaml = "0.9"
 serde = { version = "1", features = ["derive"] }
 flexbuffers = "*"
 log = "0.4"

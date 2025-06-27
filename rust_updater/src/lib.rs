@@ -4,6 +4,7 @@ use proxy_wasm::traits::*;
 use proxy_wasm::types::*;
 use serde::Deserialize;
 use serde::Serialize;
+use serde_yaml::Value;
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -31,7 +32,7 @@ struct StreamResponse {
 }
 
 //FIXME: move this to a common crate
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct BanMessage<'a> {
     ip: &'a str,
     remediation: &'a str,
@@ -51,6 +52,13 @@ struct CrowdsecUpdater {
     is_startup: bool,
     worker_names_queue_id: Option<u32>,
     worker_queues_ids: Vec<u32>,
+    api_key: String,
+    cluster_name: String,
+    crowdsec_url: String,
+    scopes: Vec<String>,
+    origins: Vec<String>,
+    scenarios_containing: Vec<String>,
+    scenarios_not_containing: Vec<String>,
 }
 
 impl Default for CrowdsecUpdater {
@@ -60,6 +68,13 @@ impl Default for CrowdsecUpdater {
             worker_names_queue_id: None,
             is_startup: true,
             worker_queues_ids: vec![],
+            api_key: String::new(),
+            cluster_name: String::new(),
+            crowdsec_url: String::new(),
+            scopes: Vec::new(),
+            origins: Vec::new(),
+            scenarios_containing: Vec::new(),
+            scenarios_not_containing: Vec::new(),
         }
     }
 }
@@ -71,12 +86,101 @@ proxy_wasm::main! {{
     proxy_wasm::set_root_context(|_| -> Box<dyn RootContext> { Box::new(CrowdsecUpdater::default()) });
 }}
 
+impl CrowdsecUpdater {
+    fn send_batched(&self, messages: &[BanMessage]) {
+        if messages.is_empty() {
+            return;
+        }
+
+        let mut batch = Vec::new();
+        let mut current_batch_size = 0;
+
+        for msg in messages {
+            let msg_bytes = flexbuffers::to_vec(msg).unwrap();
+            if current_batch_size + msg_bytes.len() > MAX_BATCH_BYTES || batch.len() >= BATCH_SIZE {
+                // Send current batch
+                self.broadcast_decisions(&batch);
+                batch.clear();
+                current_batch_size = 0;
+            }
+            batch.push(msg.clone());
+            current_batch_size += msg_bytes.len();
+        }
+
+        // Send remaining batch
+        if !batch.is_empty() {
+            self.broadcast_decisions(&batch);
+        }
+    }
+}
+
 impl RootContext for CrowdsecUpdater {
     fn on_vm_start(&mut self, _: usize) -> bool {
         self.worker_names_queue_id =
             proxy_wasm::hostcalls::register_shared_queue(&STR_WORKER_NAMES_QUEUE).ok();
-        self.set_tick_period(Duration::from_secs(10));
-        info!("Updater started!");
+        true
+    }
+
+    fn on_configure(&mut self, _: usize) -> bool {
+        // Set defaults
+        self.cluster_name = "crowdsec_cluster".to_string();
+        self.crowdsec_url = "http://crowdsec:8080".to_string();
+
+        if let Some(config_bytes) = self.get_plugin_configuration() {
+            if let Ok(config_str) = String::from_utf8(config_bytes) {
+                if let Ok(yaml) = serde_yaml::from_str::<Value>(&config_str) {
+                    if let Some(secs) = yaml.get("poll_interval").and_then(|v| v.as_u64()) {
+                        self.set_tick_period(Duration::from_secs(secs));
+                        info!("Updater started! Poll interval: {}s", secs);
+                    }
+                    if let Some(key) = yaml.get("api_key").and_then(|v| v.as_str()) {
+                        self.api_key = key.to_string();
+                    } else {
+                        proxy_wasm::hostcalls::log(LogLevel::Warn, "No API key configured!").ok();
+                    }
+                    if let Some(cluster) = yaml.get("cluster_name").and_then(|v| v.as_str()) {
+                        self.cluster_name = cluster.to_string();
+                    }
+                    if let Some(url) = yaml.get("crowdsec_url").and_then(|v| v.as_str()) {
+                        self.crowdsec_url = url.to_string();
+                    }
+                    if let Some(scopes) = yaml.get("scopes").and_then(|v| v.as_sequence()) {
+                        self.scopes = scopes
+                            .iter()
+                            .filter_map(|v| v.as_str())
+                            .map(|s| s.to_string())
+                            .collect();
+                    }
+                    if let Some(origins) = yaml.get("origins").and_then(|v| v.as_sequence()) {
+                        self.origins = origins
+                            .iter()
+                            .filter_map(|v| v.as_str())
+                            .map(|s| s.to_string())
+                            .collect();
+                    }
+                    if let Some(scenarios) = yaml
+                        .get("scenarios_containing")
+                        .and_then(|v| v.as_sequence())
+                    {
+                        self.scenarios_containing = scenarios
+                            .iter()
+                            .filter_map(|v| v.as_str())
+                            .map(|s| s.to_string())
+                            .collect();
+                    }
+                    if let Some(scenarios) = yaml
+                        .get("scenarios_not_containing")
+                        .and_then(|v| v.as_sequence())
+                    {
+                        self.scenarios_not_containing = scenarios
+                            .iter()
+                            .filter_map(|v| v.as_str())
+                            .map(|s| s.to_string())
+                            .collect();
+                    }
+                }
+            }
+        }
         true
     }
 
@@ -146,28 +250,61 @@ impl RootContext for CrowdsecUpdater {
             return;
         }
 
-        let path = if self.is_startup {
-            "/v1/decisions/stream?startup=true"
+        let mut path = if self.is_startup {
+            "/v1/decisions/stream?startup=true".to_string()
         } else {
-            "/v1/decisions/stream"
+            "/v1/decisions/stream".to_string()
         };
+
+        // Build query parameters
+        let mut query_params = Vec::new();
+
+        if !self.scopes.is_empty() {
+            query_params.push(format!("scopes={}", self.scopes.join(",")));
+        }
+        if !self.origins.is_empty() {
+            query_params.push(format!("origins={}", self.origins.join(",")));
+        }
+        if !self.scenarios_containing.is_empty() {
+            query_params.push(format!(
+                "scenarios_containing={}",
+                self.scenarios_containing.join(",")
+            ));
+        }
+        if !self.scenarios_not_containing.is_empty() {
+            query_params.push(format!(
+                "scenarios_not_containing={}",
+                self.scenarios_not_containing.join(",")
+            ));
+        }
+
+        if !query_params.is_empty() {
+            let separator = if path.contains('?') { "&" } else { "?" };
+            path = format!("{}{}{}", path, separator, query_params.join("&"));
+        }
+
         self.is_startup = false;
 
         let headers = vec![
             (":method", "GET"),
-            (":path", path),
+            (":path", &path),
             (":authority", "crowdsec"),
-            ("x-api-key", "thisisabouncerkey"),
+            ("x-api-key", &self.api_key),
         ];
-        info!("Askin the crowdsec LAPI for decisions {path}");
-        self.dispatch_http_call(
-            "crowdsec_cluster",
+        info!("Asking the crowdsec LAPI for decisions {path}");
+        if let Err(e) = self.dispatch_http_call(
+            &self.cluster_name,
             headers,
             None,
             vec![],
             Duration::from_secs(5),
-        )
-        .ok();
+        ) {
+            proxy_wasm::hostcalls::log(
+                LogLevel::Error,
+                &format!("Failed to dispatch HTTP call: {:?}", e),
+            )
+            .ok();
+        }
     }
 }
 
@@ -241,12 +378,6 @@ impl Context for CrowdsecUpdater {
 }
 
 impl CrowdsecUpdater {
-    fn send_batched(&self, messages: &[BanMessage]) {
-        for chunk in messages.chunks(BATCH_SIZE) {
-            self.broadcast_decisions(chunk);
-        }
-    }
-
     fn broadcast_decisions(&self, decisions: &[BanMessage]) {
         let mut s = flexbuffers::FlexbufferSerializer::new();
         if let Err(e) = decisions.serialize(&mut s) {

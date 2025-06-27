@@ -13,9 +13,19 @@ bootstrap_extensions:
       configuration:
         "@type": type.googleapis.com/google.protobuf.StringValue
         value: |
-          {
-            "my_config_value": "my_value"
-          }
+          poll_interval: 50
+          api_key: "thisisabouncerkey"
+          cluster_name: "crowdsec_cluster"
+          crowdsec_url: "http://crowdsec:8080"
+          #scopes:
+          #  - "ip"
+          #  - "range"
+          #scenarios_containing:
+          #  - "ssh-bf"
+          #  - "http-bf"
+          #scenarios_not_containing:
+          #  - "test"
+          #  - "debug"
       vm_config:
         runtime: "envoy.wasm.runtime.v8"
         vm_id: "crowdsec_singleton"
@@ -92,6 +102,19 @@ static_resources:
     type: LOGICAL_DNS
     # Comment out the following line to test on v6 networks
     dns_lookup_family: V4_ONLY
+#    transport_socket:
+#      name: envoy.transport_sockets.tls
+#      typed_config:
+#        "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+#        common_tls_context:
+#          tls_certificates:
+#          - certificate_chain:
+#              filename: "/etc/envoy/certs/client.crt"
+#            private_key:
+#              filename: "/etc/envoy/certs/client.key"
+#          validation_context:
+#            trusted_ca:
+#              filename: "/etc/envoy/certs/ca.crt"
     load_assignment:
       cluster_name: crowdsec_cluster
       endpoints:
