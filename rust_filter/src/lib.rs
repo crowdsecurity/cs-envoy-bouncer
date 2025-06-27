@@ -1,15 +1,16 @@
 use flexbuffers;
+use ipnet::Ipv4Net;
+use iprange::IpRange;
 use proxy_wasm::traits::*;
 use proxy_wasm::types::*;
-use serde::Deserialize;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::time::Duration;
-use log;
+use uuid;
 
-// We use Rc<RefCell<HashSet<String>>> for the ban list to share mutable state
+// We use Rc<RefCell<IpStorage>> for the ban list to share mutable state
 // between the root context and all HTTP contexts. This is necessary because
 // the proxy-wasm SDK requires all subcontexts (like HttpContext) to be 'static,
 // meaning they cannot hold non-static references to data owned by the root context.
@@ -20,27 +21,145 @@ use log;
 // requirements and Rust's safety guarantees.
 //
 // Shared ban list type
-type SharedBans = Rc<RefCell<HashSet<String>>>;
+type SharedBans = Rc<RefCell<IpStorage>>;
+
+// Fast IP storage using separate storage for single IPs vs ranges
+struct IpStorage {
+    single_ips: HashSet<std::net::Ipv4Addr>, // Fast lookup for single IPs
+    ip_range: IpRange<Ipv4Net>,              // For CIDR ranges
+}
+
+impl IpStorage {
+    fn new() -> Self {
+        Self {
+            single_ips: HashSet::new(),
+            ip_range: IpRange::new(),
+        }
+    }
+
+    fn insert(&mut self, ip: String, is_range: bool) {
+        let start_time = std::time::Instant::now();
+
+        if is_range {
+            // It's a CIDR range, parse as Ipv4Net
+            if let Ok(network) = ip.parse::<Ipv4Net>() {
+                let range_start = std::time::Instant::now();
+                // More efficient: add to existing range instead of rebuilding
+                let mut networks: Vec<Ipv4Net> = self.ip_range.iter().collect();
+                networks.push(network);
+                self.ip_range = networks.into_iter().collect();
+                let range_duration = range_start.elapsed();
+                let total_duration = start_time.elapsed();
+                proxy_wasm::hostcalls::log(
+                    LogLevel::Debug,
+                    &format!(
+                        "Inserted range {} in {:?} (total: {:?})",
+                        ip, range_duration, total_duration
+                    ),
+                )
+                .ok();
+            }
+        } else {
+            // It's a single IP, store in HashSet for fast lookup
+            if let Ok(ip_addr) = ip.parse::<std::net::Ipv4Addr>() {
+                let single_start = std::time::Instant::now();
+                self.single_ips.insert(ip_addr);
+                let single_duration = single_start.elapsed();
+                let total_duration = start_time.elapsed();
+                proxy_wasm::hostcalls::log(
+                    LogLevel::Debug,
+                    &format!(
+                        "Inserted single IP {} in {:?} (total: {:?})",
+                        ip, single_duration, total_duration
+                    ),
+                )
+                .ok();
+            }
+        }
+    }
+
+    fn contains(&self, ip: &str) -> bool {
+        let start_time = std::time::Instant::now();
+
+        // Check single IPs (fast HashSet lookup)
+        if let Ok(ip_addr) = ip.parse::<std::net::Ipv4Addr>() {
+            if self.single_ips.contains(&ip_addr) {
+                let duration = start_time.elapsed();
+                proxy_wasm::hostcalls::log(
+                    LogLevel::Debug,
+                    &format!("IP {} found in single_ips in {:?}", ip, duration),
+                )
+                .ok();
+                return true;
+            }
+
+            // Check iprange radix tree for ranges
+            let range_start = std::time::Instant::now();
+            let result = self.ip_range.contains(&ip_addr);
+            let range_duration = range_start.elapsed();
+            let total_duration = start_time.elapsed();
+
+            if result {
+                proxy_wasm::hostcalls::log(
+                    LogLevel::Debug,
+                    &format!(
+                        "IP {} found in ip_range in {:?} (total: {:?})",
+                        ip, range_duration, total_duration
+                    ),
+                )
+                .ok();
+            } else {
+                proxy_wasm::hostcalls::log(
+                    LogLevel::Debug,
+                    &format!(
+                        "IP {} not found in any storage (total: {:?})",
+                        ip, total_duration
+                    ),
+                )
+                .ok();
+            }
+            return result;
+        }
+
+        let duration = start_time.elapsed();
+        proxy_wasm::hostcalls::log(
+            LogLevel::Debug,
+            &format!("IP {} failed to parse as IPv4 (total: {:?})", ip, duration),
+        )
+        .ok();
+        false
+    }
+
+    fn remove(&mut self, ip: &str) {
+        if let Ok(ip_addr) = ip.parse::<std::net::Ipv4Addr>() {
+            self.single_ips.remove(&ip_addr); // O(1) HashSet removal
+        }
+        // Also try to remove as a CIDR range
+        if let Ok(network) = ip.parse::<Ipv4Net>() {
+            self.ip_range.remove(network);
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug)]
 struct BanMessage {
     ip: String,
     remediation: String,
     expiration: String,
+    is_range: bool, // true if it's a CIDR range, false if it's a single IP
 }
 
 struct CrowdsecFilter {
     has_sent_name: bool,
     bans: SharedBans,
     worker_uuid: uuid::Uuid,
-    // bans: HashSet<String>
 }
 
 impl Default for CrowdsecFilter {
     fn default() -> Self {
         Self {
             has_sent_name: false,
-            bans: Rc::new(RefCell::new(HashSet::new())),
+            bans: Rc::new(RefCell::new(IpStorage::new())),
             worker_uuid: uuid::Uuid::new_v4(),
         }
     }
@@ -138,7 +257,7 @@ impl RootContext for CrowdsecFilter {
 
     fn create_http_context(&self, _context_id: u32) -> Option<Box<dyn HttpContext>> {
         Some(Box::new(CrowdsecFilterHttp {
-            bans: Rc::clone(&self.bans),
+            bans: self.bans.clone(),
         }))
     }
 
@@ -161,7 +280,7 @@ impl RootContext for CrowdsecFilter {
                         if msg.remediation == "unban" {
                             bans.remove(&msg.ip);
                         } else {
-                            bans.insert(msg.ip);
+                            bans.insert(msg.ip, msg.is_range);
                         }
                     }
                 } else if let Ok(msg) = flexbuffers::from_slice::<BanMessage>(&payload) {
@@ -171,7 +290,7 @@ impl RootContext for CrowdsecFilter {
                     if msg.remediation == "unban" {
                         bans.remove(&msg.ip);
                     } else {
-                        bans.insert(msg.ip);
+                        bans.insert(msg.ip, msg.is_range);
                     }
                 }
             }
@@ -202,7 +321,8 @@ impl HttpContext for CrowdsecFilterHttp {
                 // addr is typically in the form "IP:port"
                 let ip = addr.split(':').next().unwrap_or("");
                 if self.bans.borrow().contains(ip) {
-                    log::info!("IP {} is banned!", ip);
+                    proxy_wasm::hostcalls::log(LogLevel::Info, &format!("IP {} is banned!", ip))
+                        .ok();
                     self.send_http_response(
                         403,
                         vec![("content-type", "text/plain")],
@@ -212,9 +332,9 @@ impl HttpContext for CrowdsecFilterHttp {
                 }
             }
         } else {
-            log::info!("Could not get source address");
+            proxy_wasm::hostcalls::log(LogLevel::Info, "Could not get source address").ok();
         }
-        
+
         Action::Continue
     }
 }

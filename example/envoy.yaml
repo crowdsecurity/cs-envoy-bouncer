@@ -13,7 +13,7 @@ bootstrap_extensions:
       configuration:
         "@type": type.googleapis.com/google.protobuf.StringValue
         value: |
-          poll_interval: 50
+          poll_interval: 10
           api_key: "thisisabouncerkey"
           cluster_name: "crowdsec_cluster"
           crowdsec_url: "http://crowdsec:8080"
@@ -61,9 +61,7 @@ static_resources:
                   configuration:
                     "@type": type.googleapis.com/google.protobuf.StringValue
                     value: |
-                      {
-                        "my_config_value": "my_value"
-                      }
+                      {}
                   vm_config:
                     runtime: "envoy.wasm.runtime.v8"
                     vm_id: "crowdsec_filter"
@@ -124,4 +122,3 @@ static_resources:
               socket_address:
                 address: crowdsec
                 port_value: 8080
-

@@ -37,6 +37,7 @@ struct BanMessage<'a> {
     ip: &'a str,
     remediation: &'a str,
     expiration: &'a str,
+    is_range: bool, // true if it's a CIDR range, false if it's a single IP
 }
 
 //TODO: should this be moved to another crate ?
@@ -111,6 +112,11 @@ impl CrowdsecUpdater {
         if !batch.is_empty() {
             self.broadcast_decisions(&batch);
         }
+    }
+
+    fn is_cidr_range(&self, value: &str) -> bool {
+        // Check if it contains a slash (CIDR notation)
+        value.contains('/')
     }
 }
 
@@ -346,6 +352,7 @@ impl Context for CrowdsecUpdater {
                 ip: &dec.value,
                 remediation: "unban",
                 expiration: "",
+                is_range: self.is_cidr_range(&dec.value),
             };
             to_send.push(msg);
         }
@@ -358,6 +365,7 @@ impl Context for CrowdsecUpdater {
                 ip: &dec.value,
                 remediation,
                 expiration,
+                is_range: self.is_cidr_range(&dec.value),
             };
             to_send.push(msg);
         }
