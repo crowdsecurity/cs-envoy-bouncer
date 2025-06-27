@@ -7,6 +7,7 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::time::Duration;
+use log;
 
 // We use Rc<RefCell<HashSet<String>>> for the ban list to share mutable state
 // between the root context and all HTTP contexts. This is necessary because
@@ -61,7 +62,7 @@ impl RootContext for CrowdsecFilter {
         let worker_queue_name = format!("crowdsec_worker_{}", self.worker_uuid);
 
         match proxy_wasm::hostcalls::register_shared_queue(&worker_queue_name) {
-            Ok(queue_id) => {
+            Ok(_queue_id) => {
                 proxy_wasm::hostcalls::log(
                     LogLevel::Debug,
                     &format!("Registered shared queue: {}", worker_queue_name),
@@ -135,9 +136,8 @@ impl RootContext for CrowdsecFilter {
         self.has_sent_name = true;
     }
 
-    fn create_http_context(&self, context_id: u32) -> Option<Box<dyn HttpContext>> {
+    fn create_http_context(&self, _context_id: u32) -> Option<Box<dyn HttpContext>> {
         Some(Box::new(CrowdsecFilterHttp {
-            context_id,
             bans: Rc::clone(&self.bans),
         }))
     }
@@ -190,43 +190,31 @@ impl RootContext for CrowdsecFilter {
 }
 
 struct CrowdsecFilterHttp {
-    context_id: u32,
     bans: SharedBans,
 }
 
 impl Context for CrowdsecFilterHttp {}
 impl HttpContext for CrowdsecFilterHttp {
-    fn on_http_request_headers(&mut self, num_headers: usize, end_of_stream: bool) -> Action {
-        proxy_wasm::hostcalls::log(
-            LogLevel::Info,
-            &format!(
-                "Received {num_headers} HTTP request headers | end_of_stream: {end_of_stream}"
-            ),
-        )
-        .ok();
-
-        // Extract IP from headers
-        if let Some(ip) = self.get_http_request_header("x-forwarded-for") {
-            if self.bans.borrow().contains(&ip) {
-                self.send_http_response(
-                    403,
-                    vec![("content-type", "text/plain")],
-                    Some(b"Forbidden: Your IP is banned.\n"),
-                );
-                return Action::Pause;
+    fn on_http_request_headers(&mut self, _num_headers: usize, _end_of_stream: bool) -> Action {
+        // Get client IP from Envoy's source address property
+        if let Some(addr_bytes) = self.get_property(vec!["source", "address"]) {
+            if let Ok(addr) = String::from_utf8(addr_bytes) {
+                // addr is typically in the form "IP:port"
+                let ip = addr.split(':').next().unwrap_or("");
+                if self.bans.borrow().contains(ip) {
+                    log::info!("IP {} is banned!", ip);
+                    self.send_http_response(
+                        403,
+                        vec![("content-type", "text/plain")],
+                        Some(b"Forbidden: Your IP is banned.\n"),
+                    );
+                    return Action::Pause;
+                }
             }
+        } else {
+            log::info!("Could not get source address");
         }
-        Action::Continue
-    }
-
-    fn on_http_request_body(&mut self, body_size: usize, end_of_stream: bool) -> Action {
-        proxy_wasm::hostcalls::log(
-            LogLevel::Info,
-            &format!(
-                "Received HTTP request body of size {body_size} | end_of_stream: {end_of_stream}"
-            ),
-        )
-        .ok();
+        
         Action::Continue
     }
 }
