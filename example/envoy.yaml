@@ -61,7 +61,12 @@ static_resources:
                   configuration:
                     "@type": type.googleapis.com/google.protobuf.StringValue
                     value: |
-                      {}
+                      # Filter configuration
+                      tick_period: 2  # seconds
+                      worker_names_queue: "crowdsec_worker_names"
+                      singleton_name: "crowdsec_singleton"
+                      response_code: 403
+                      response_message: "Forbidden: Your IP is banned."
                   vm_config:
                     runtime: "envoy.wasm.runtime.v8"
                     vm_id: "crowdsec_filter"
