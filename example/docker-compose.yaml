@@ -26,6 +26,7 @@ services:
     image: crowdsecurity/crowdsec:latest
     environment:
       - BOUNCER_KEY_envoy2=thisisabouncerkey
+      - COLLECTIONS=crowdsecurity/appsec-virtual-patching
     volumes:
       - crowdsec-db:/var/lib/crowdsec/data/
       - crowdsec-config:/etc/crowdsec/
