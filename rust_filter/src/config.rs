@@ -18,6 +18,22 @@ pub struct Config {
 
     #[serde(default = "default_response_message")]
     pub response_message: String,
+
+    // WAF configuration
+    #[serde(default = "default_waf_enabled")]
+    pub waf_enabled: bool,
+
+    #[serde(default = "default_waf_forward_on_decision")]
+    pub waf_forward_on_decision: bool,
+
+    #[serde(default = "default_waf_url")]
+    pub waf_url: String,
+
+    #[serde(default = "default_waf_api_key")]
+    pub waf_api_key: String,
+
+    #[serde(default = "default_waf_timeout_ms")]
+    pub waf_timeout_ms: u64,
 }
 
 /// Consolidated configuration for the CrowdSec filter
@@ -28,6 +44,12 @@ pub struct FilterConfig {
     pub singleton_name: String,
     pub response_code: u16,
     pub response_message: String,
+    // WAF configuration
+    pub waf_enabled: bool,
+    pub waf_forward_on_decision: bool,
+    pub waf_url: String,
+    pub waf_api_key: String,
+    pub waf_timeout: Duration,
 }
 
 impl From<Config> for FilterConfig {
@@ -38,6 +60,11 @@ impl From<Config> for FilterConfig {
             singleton_name: config.singleton_name,
             response_code: config.response_code,
             response_message: config.response_message,
+            waf_enabled: config.waf_enabled,
+            waf_forward_on_decision: config.waf_forward_on_decision,
+            waf_url: config.waf_url,
+            waf_api_key: config.waf_api_key,
+            waf_timeout: Duration::from_millis(config.waf_timeout_ms),
         }
     }
 }
@@ -50,6 +77,11 @@ impl Default for FilterConfig {
             singleton_name: "crowdsec_singleton".to_string(),
             response_code: 403,
             response_message: "Forbidden: Your IP is banned.".to_string(),
+            waf_enabled: false,
+            waf_forward_on_decision: false,
+            waf_url: String::new(),
+            waf_api_key: String::new(),
+            waf_timeout: Duration::from_millis(500), // Total timeout
         }
     }
 }
@@ -73,6 +105,19 @@ impl FilterConfig {
             return Err("response_code must be between 100 and 599".to_string());
         }
 
+        // Validate WAF configuration
+        if self.waf_enabled {
+            if self.waf_url.is_empty() {
+                return Err("waf_url cannot be empty when WAF is enabled".to_string());
+            }
+            if self.waf_api_key.is_empty() {
+                return Err("waf_api_key cannot be empty when WAF is enabled".to_string());
+            }
+            if self.waf_timeout.as_millis() == 0 {
+                return Err("waf_timeout must be greater than 0".to_string());
+            }
+        }
+
         Ok(())
     }
 }
@@ -91,6 +136,23 @@ fn default_response_code() -> u16 {
 }
 fn default_response_message() -> String {
     "Forbidden: Your IP is banned.".to_string()
+}
+
+// WAF default functions
+fn default_waf_enabled() -> bool {
+    false
+}
+fn default_waf_forward_on_decision() -> bool {
+    false
+}
+fn default_waf_url() -> String {
+    String::new()
+}
+fn default_waf_api_key() -> String {
+    String::new()
+}
+fn default_waf_timeout_ms() -> u64 {
+    500 // Total timeout for WAF request
 }
 
 pub fn parse_config(config_bytes: &[u8]) -> Result<FilterConfig, Box<dyn std::error::Error>> {
@@ -118,6 +180,30 @@ pub fn parse_config(config_bytes: &[u8]) -> Result<FilterConfig, Box<dyn std::er
         &format!("Response code: {}", filter_config.response_code),
     )
     .ok();
+    
+    // Log WAF configuration
+    proxy_wasm::hostcalls::log(
+        LogLevel::Info,
+        &format!("WAF enabled: {}", filter_config.waf_enabled),
+    )
+    .ok();
+    if filter_config.waf_enabled {
+        proxy_wasm::hostcalls::log(
+            LogLevel::Info,
+            &format!("WAF URL: {}", filter_config.waf_url),
+        )
+        .ok();
+        proxy_wasm::hostcalls::log(
+            LogLevel::Info,
+            &format!("WAF forward on decision: {}", filter_config.waf_forward_on_decision),
+        )
+        .ok();
+        proxy_wasm::hostcalls::log(
+            LogLevel::Info,
+            &format!("WAF timeout: {}ms", filter_config.waf_timeout.as_millis()),
+        )
+        .ok();
+    }
 
     Ok(filter_config)
 }
@@ -196,5 +282,48 @@ response_code: 451
         config = FilterConfig::default();
         config.singleton_name = String::new();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_waf_config_validation() {
+        let mut config = FilterConfig::default();
+        
+        // WAF disabled should always be valid
+        config.waf_enabled = false;
+        assert!(config.validate().is_ok());
+        
+        // WAF enabled with empty URL should fail
+        config.waf_enabled = true;
+        config.waf_url = String::new();
+        assert!(config.validate().is_err());
+        
+        // WAF enabled with empty API key should fail
+        config.waf_url = "http://crowdsec_waf/waf".to_string();
+        config.waf_api_key = String::new();
+        assert!(config.validate().is_err());
+        
+        // WAF enabled with zero timeout should fail
+        config.waf_api_key = "test-key".to_string();
+        config.waf_timeout = Duration::from_millis(0);
+        assert!(config.validate().is_err());
+        
+        // Valid WAF config should pass
+        config.waf_timeout = Duration::from_millis(500);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_waf_config_defaults() {
+        let yaml = r#"
+waf_enabled: true
+waf_url: "http://crowdsec_waf/waf"
+waf_api_key: "test-key"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.waf_enabled, true);
+        assert_eq!(config.waf_url, "http://crowdsec_waf/waf");
+        assert_eq!(config.waf_api_key, "test-key");
+        assert_eq!(config.waf_forward_on_decision, false); // default
+        assert_eq!(config.waf_timeout_ms, 500); // default
     }
 }

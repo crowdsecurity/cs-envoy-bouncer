@@ -78,6 +78,7 @@ use proxy_wasm::traits::*;
 use proxy_wasm::types::*;
 use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
+use serde_json;
 use std::cell::RefCell;
 use std::net::IpAddr;
 use std::rc::Rc;
@@ -168,6 +169,13 @@ struct BanMessage {
     ip: IpNet,
     remediation: String,
     expiration: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct WafResponse {
+    action: String,
+    #[serde(default)]
+    http_status: Option<u16>,
 }
 
 struct CrowdsecFilter {
@@ -299,10 +307,10 @@ impl RootContext for CrowdsecFilter {
     }
 
     fn create_http_context(&self, _context_id: u32) -> Option<Box<dyn HttpContext>> {
-        Some(Box::new(CrowdsecFilterHttp {
-            bans: Rc::clone(&self.bans),
-            config: self.config.clone(),
-        }))
+        Some(Box::new(CrowdsecFilterHttp::new(
+            Rc::clone(&self.bans),
+            self.config.clone(),
+        )))
     }
 
     fn on_queue_ready(&mut self, queue_id: u32) {
@@ -354,30 +362,473 @@ impl RootContext for CrowdsecFilter {
 struct CrowdsecFilterHttp {
     bans: SharedBans,
     config: FilterConfig,
+    request_body: Vec<u8>,
+    has_request_body: bool,
+    // Cached WAF URL parsing result (cluster, path, authority)
+    waf_url_parts: Option<(String, String, String)>,
+    // Cached headers for WAF processing
+    cached_headers: Option<CachedRequestHeaders>,
 }
 
-impl Context for CrowdsecFilterHttp {}
+#[derive(Debug, Clone)]
+struct CachedRequestHeaders {
+    uri: String,
+    host: String,
+    method: String,
+    user_agent: String,
+    request_headers: Vec<(String, String)>,
+}
+
+impl CrowdsecFilterHttp {
+    fn new(bans: SharedBans, config: FilterConfig) -> Self {
+        let waf_url_parts = if config.waf_enabled {
+            Self::parse_waf_url_static(&config.waf_url).ok()
+        } else {
+            None
+        };
+        
+        Self {
+            bans,
+            config,
+            request_body: Vec::new(),
+            has_request_body: false,
+            waf_url_parts,
+            cached_headers: None,
+        }
+    }
+
+    fn parse_waf_url_static(url: &str) -> Result<(String, String, String), String> {
+        // Simple URL parsing for http://host:port/path format
+        let without_scheme = url
+            .strip_prefix("http://")
+            .or_else(|| url.strip_prefix("https://"))
+            .ok_or("WAF URL must start with http:// or https://")?;
+        
+        // Split into host_port and path parts
+        let (host_port, path) = if let Some(slash_pos) = without_scheme.find('/') {
+            (&without_scheme[..slash_pos], &without_scheme[slash_pos..])
+        } else {
+            (without_scheme, "/")
+        };
+        
+        if host_port.is_empty() {
+            return Err("WAF URL missing host".to_string());
+        }
+        
+        // Use the first part (before any colon) as cluster name
+        let cluster = if let Some(colon_pos) = host_port.find(':') {
+            &host_port[..colon_pos]
+        } else {
+            host_port
+        };
+        
+        Ok((cluster.to_string(), path.to_string(), host_port.to_string()))
+    }
+
+    fn cache_request_headers(&mut self) {
+        // Cache headers that will be needed for WAF processing
+        let uri = self.get_http_request_header(":path")
+            .unwrap_or_else(|| "/".to_string());
+        let host = self.get_http_request_header(":authority")
+            .or_else(|| self.get_http_request_header("host"))
+            .unwrap_or_else(|| "unknown".to_string());
+        let method = self.get_http_request_header(":method")
+            .unwrap_or_else(|| "GET".to_string());
+        let user_agent = self.get_http_request_header("user-agent")
+            .unwrap_or_else(|| "unknown".to_string());
+        
+        // Cache all request headers (excluding pseudo-headers and CrowdSec headers)
+        let request_headers = self.get_http_request_headers()
+            .into_iter()
+            .filter(|(name, _)| !name.starts_with(':') && !name.starts_with("X-Crowdsec-Appsec-"))
+            .collect();
+
+        self.cached_headers = Some(CachedRequestHeaders {
+            uri,
+            host,
+            method,
+            user_agent,
+            request_headers,
+        });
+    }
+
+    fn send_waf_request(&self, ip_addr: IpAddr, body: Option<&[u8]>) -> Result<u32, String> {
+        let headers = self.build_waf_headers(ip_addr, body)?;
+        
+        // Use cached URL parts
+        let (cluster, path, authority) = self.waf_url_parts.as_ref()
+            .ok_or("WAF URL not initialized")?;
+        
+        let timeout = self.config.waf_timeout;
+
+        let log_msg = if let Some(body_data) = body {
+            format!("Sending WAF request with body to cluster: {}, path: {}, authority: {} with timeout: {:?}ms, body size: {} bytes", 
+                cluster, path, authority, timeout.as_millis(), body_data.len())
+        } else {
+            format!("Sending WAF request to cluster: {}, path: {}, authority: {} with timeout: {:?}ms", 
+                cluster, path, authority, timeout.as_millis())
+        };
+        proxy_wasm::hostcalls::log(LogLevel::Info, &log_msg).ok();
+
+        // Build header pairs directly with references
+        let mut header_pairs = vec![
+            (":method", "POST"),
+            (":path", path.as_str()),
+            (":authority", authority.as_str()),
+        ];
+        
+        // Add custom headers
+        let custom_header_pairs: Vec<(&str, &str)> = headers.iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        header_pairs.extend(custom_header_pairs);
+
+        // Log some key headers for debugging
+        for (k, v) in &header_pairs {
+            if k.starts_with("X-Crowdsec-Appsec-") || k.starts_with(":") {
+                proxy_wasm::hostcalls::log(
+                    LogLevel::Debug, 
+                    &format!("WAF Header: {}: {}", k, v)
+                ).ok();
+            }
+        }
+
+        match self.dispatch_http_call(
+            &cluster,
+            header_pairs,
+            body,
+            vec![],
+            timeout,
+        ) {
+            Ok(token_id) => {
+                let success_msg = if body.is_some() {
+                    format!("dispatch_http_call with body successful, token_id: {}", token_id)
+                } else {
+                    format!("dispatch_http_call successful, token_id: {}", token_id)
+                };
+                proxy_wasm::hostcalls::log(LogLevel::Info, &success_msg).ok();
+                Ok(token_id)
+            },
+            Err(e) => {
+                let error_msg = format!("Failed to dispatch WAF request: {:?}", e);
+                proxy_wasm::hostcalls::log(LogLevel::Error, &error_msg).ok();
+                Err(error_msg)
+            }
+        }
+    }
+
+    fn build_waf_headers(&self, ip_addr: IpAddr, body: Option<&[u8]>) -> Result<Vec<(String, String)>, String> {
+        let mut headers = Vec::new();
+
+        // Use cached headers when we have a body (body phase), direct access for header-only requests (header phase)
+        let (uri, host, method, user_agent, request_headers) = if body.is_some() {
+            // Body phase - use cached headers to avoid proxy-wasm access issues
+            let cached = self.cached_headers.as_ref()
+                .ok_or("Headers not cached - call cache_request_headers() during header phase")?;
+            (cached.uri.clone(), cached.host.clone(), cached.method.clone(), 
+             cached.user_agent.clone(), cached.request_headers.clone())
+        } else {
+            // Header phase - can access headers directly
+            let uri = self.get_http_request_header(":path")
+                .unwrap_or_else(|| "/".to_string());
+            let host = self.get_http_request_header(":authority")
+                .or_else(|| self.get_http_request_header("host"))
+                .unwrap_or_else(|| "unknown".to_string());
+            let method = self.get_http_request_header(":method")
+                .unwrap_or_else(|| "GET".to_string());
+            let user_agent = self.get_http_request_header("user-agent")
+                .unwrap_or_else(|| "unknown".to_string());
+            
+            let request_headers = self.get_http_request_headers()
+                .into_iter()
+                .filter(|(name, _)| !name.starts_with(':') && !name.starts_with("X-Crowdsec-Appsec-"))
+                .collect();
+            
+            (uri, host, method, user_agent, request_headers)
+        };
+        
+        // Get HTTP version - proxy-wasm doesn't expose this directly, so we'll default to 11
+        let http_version = "11".to_string();
+
+        // Convert method to proper case for WAF
+        let method_upper = method.to_uppercase();
+
+        // Add required CrowdSec headers
+        headers.push(("X-Crowdsec-Appsec-Ip".to_string(), ip_addr.to_string()));
+        headers.push(("X-Crowdsec-Appsec-Uri".to_string(), uri));
+        headers.push(("X-Crowdsec-Appsec-Host".to_string(), host));
+        headers.push(("X-Crowdsec-Appsec-Verb".to_string(), method_upper));
+        headers.push(("X-Crowdsec-Appsec-Api-Key".to_string(), self.config.waf_api_key.clone()));
+        headers.push(("X-Crowdsec-Appsec-User-Agent".to_string(), user_agent));
+        headers.push(("X-Crowdsec-Appsec-Http-Version".to_string(), http_version));
+
+        // Copy original request headers
+        for (name, value) in request_headers {
+            headers.push((name, value));
+        }
+
+        // Set content-type and content-length if we have a body
+        if let Some(body_data) = body {
+            headers.push(("Content-Length".to_string(), body_data.len().to_string()));
+            // Find content-type from the request headers we just processed
+            if let Some((_, _content_type)) = headers.iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-type")) {
+                // Content-Type already added from request headers, don't duplicate
+            } else if body.is_none() {
+                // Only try to get content-type directly if we're in header phase
+                if let Some(content_type) = self.get_http_request_header("content-type") {
+                    headers.push(("Content-Type".to_string(), content_type));
+                }
+            }
+        }
+
+        Ok(headers)
+    }
+
+    fn parse_waf_response(&self, response_body: &[u8]) -> Result<WafResponse, String> {
+        let response_str = std::str::from_utf8(response_body)
+            .map_err(|e| format!("Invalid UTF-8 in WAF response: {}", e))?;
+        
+        serde_json::from_str::<WafResponse>(response_str)
+            .map_err(|e| format!("Failed to parse WAF JSON response: {}", e))
+    }
+}
+
 impl HttpContext for CrowdsecFilterHttp {
-    fn on_http_request_headers(&mut self, _num_headers: usize, _end_of_stream: bool) -> Action {
+    fn on_http_request_headers(&mut self, _num_headers: usize, end_of_stream: bool) -> Action {
         // Get client IP from Envoy's source address property
-        if let Some(addr_bytes) = self.get_property(vec!["source", "address"]) {
-            // Use optimized IP parsing
-            if let Some(ip_addr) = parse_ip_from_bytes(&addr_bytes) {
-                if self.bans.borrow().contains_direct(ip_addr) {
-                    proxy_wasm::hostcalls::log(LogLevel::Info, "IP banned").ok();
+        let client_ip = if let Some(addr_bytes) = self.get_property(vec!["source", "address"]) {
+            parse_ip_from_bytes(&addr_bytes)
+        } else {
+            proxy_wasm::hostcalls::log(LogLevel::Info, "Could not get source address").ok();
+            None
+        };
+
+        // Check if IP is banned
+        let is_banned = if let Some(ip_addr) = client_ip {
+            self.bans.borrow().contains_direct(ip_addr)
+        } else {
+            false
+        };
+
+        // If IP is banned and we're not configured to forward on decision, block immediately
+        if is_banned && !self.config.waf_forward_on_decision {
+            proxy_wasm::hostcalls::log(LogLevel::Info, "IP banned").ok();
+            self.send_http_response(
+                self.config.response_code as u32,
+                vec![("content-type", "text/plain")],
+                Some(self.config.response_message.as_bytes()),
+            );
+            return Action::Pause;
+        }
+
+        // Check if request has body
+        self.has_request_body = !end_of_stream;
+
+        // If WAF is enabled, handle based on whether there's a body
+        if self.config.waf_enabled {
+            proxy_wasm::hostcalls::log(
+                LogLevel::Info, 
+                &format!("WAF is enabled, processing request from IP: {:?}", client_ip)
+            ).ok();
+            
+            // Cache headers if we have a body (will need them in body phase)
+            if self.has_request_body {
+                self.cache_request_headers();
+            }
+            
+            if let Some(ip_addr) = client_ip {
+                if !self.has_request_body {
+                    // No body, process headers only
+                    proxy_wasm::hostcalls::log(
+                        LogLevel::Info, 
+                        &format!("Forwarding request to WAF (headers only) for IP: {}", ip_addr)
+                    ).ok();
+                    match self.send_waf_request(ip_addr, None) {
+                        Ok(token_id) => {
+                            proxy_wasm::hostcalls::log(
+                                LogLevel::Info, 
+                                &format!("WAF request sent successfully (headers only), token_id: {}", token_id)
+                            ).ok();
+                            return Action::Pause; // Wait for WAF response
+                        }
+                        Err(e) => {
+                            proxy_wasm::hostcalls::log(
+                                LogLevel::Error,
+                                &format!("Failed to send WAF headers request: {}", e),
+                            ).ok();
+                        }
+                    }
+                } else {
+                    // Has body, continue to collect body data
+                    proxy_wasm::hostcalls::log(
+                        LogLevel::Info, 
+                        &format!("Request has body, continuing to collect for IP: {}", ip_addr)
+                    ).ok();
+                    return Action::Continue;
+                }
+            } else {
+                proxy_wasm::hostcalls::log(LogLevel::Warn, "WAF enabled but no client IP found").ok();
+            }
+        } else {
+            proxy_wasm::hostcalls::log(LogLevel::Debug, "WAF is disabled").ok();
+        }
+
+        // If IP is banned but we're configured to forward on decision, still block after WAF
+        if is_banned && self.config.waf_forward_on_decision {
+            proxy_wasm::hostcalls::log(LogLevel::Info, "IP banned (after WAF check)").ok();
+            self.send_http_response(
+                self.config.response_code as u32,
+                vec![("content-type", "text/plain")],
+                Some(self.config.response_message.as_bytes()),
+            );
+            return Action::Pause;
+        }
+
+        Action::Continue
+    }
+
+    fn on_http_request_body(&mut self, body_size: usize, end_of_stream: bool) -> Action {
+        // Collect body data if WAF is enabled
+        if self.config.waf_enabled && self.has_request_body {
+            if let Some(body) = self.get_http_request_body(0, body_size) {
+                self.request_body.extend_from_slice(&body);
+                proxy_wasm::hostcalls::log(
+                    LogLevel::Debug, 
+                    &format!("Collected {} bytes of body data, total: {}", body.len(), self.request_body.len())
+                ).ok();
+            }
+
+            // If this is the end of the stream, send complete request to WAF
+            if end_of_stream {
+                if let Some(addr_bytes) = self.get_property(vec!["source", "address"]) {
+                    if let Some(ip_addr) = parse_ip_from_bytes(&addr_bytes) {
+                        let body_len = self.request_body.len();
+                        proxy_wasm::hostcalls::log(
+                            LogLevel::Info, 
+                            &format!("Forwarding request to WAF (with body, {} bytes) for IP: {}", body_len, ip_addr)
+                        ).ok();
+                        // Extract body reference to avoid borrowing conflict
+                        let body_ref = &self.request_body;
+                        match self.send_waf_request(ip_addr, Some(body_ref)) {
+                            Ok(token_id) => {
+                                proxy_wasm::hostcalls::log(
+                                    LogLevel::Info, 
+                                    &format!("WAF request sent successfully (with body), token_id: {}", token_id)
+                                ).ok();
+                                return Action::Pause; // Wait for WAF response
+                            }
+                            Err(e) => {
+                                proxy_wasm::hostcalls::log(
+                                    LogLevel::Error,
+                                    &format!("Failed to send WAF body request: {}", e),
+                                ).ok();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Action::Continue
+    }
+
+}
+
+impl Context for CrowdsecFilterHttp {
+    fn on_http_call_response(&mut self, _token_id: u32, _num_headers: usize, body_size: usize, _num_trailers: usize) {
+        proxy_wasm::hostcalls::log(LogLevel::Debug, "Received WAF response").ok();
+        
+        // Check HTTP status code first
+        if let Some(status) = self.get_http_call_response_header(":status") {
+            match status.as_str() {
+                "200" => {
+                    // Request allowed - parse JSON response
+                    if body_size > 0 {
+                        if let Some(response_body) = self.get_http_call_response_body(0, body_size) {
+                            match self.parse_waf_response(&response_body) {
+                                Ok(waf_response) => {
+                                    match waf_response.action.as_str() {
+                                        "allow" => {
+                                            proxy_wasm::hostcalls::log(LogLevel::Debug, "WAF allowed request").ok();
+                                            self.resume_http_request();
+                                            return;
+                                        }
+                                        "ban" => {
+                                            proxy_wasm::hostcalls::log(LogLevel::Info, "WAF banned request").ok();
+                                            let status_code = waf_response.http_status.unwrap_or(403);
+                                            self.send_http_response(
+                                                status_code as u32,
+                                                vec![("content-type", "text/plain")],
+                                                Some(b"Forbidden: Request blocked by WAF"),
+                                            );
+                                            return;
+                                        }
+                                        "captcha" => {
+                                            proxy_wasm::hostcalls::log(LogLevel::Info, "WAF requires captcha").ok();
+                                            let status_code = waf_response.http_status.unwrap_or(403);
+                                            self.send_http_response(
+                                                status_code as u32,
+                                                vec![("content-type", "text/html")],
+                                                Some(b"<html><body>Please complete CAPTCHA verification</body></html>"),
+                                            );
+                                            return;
+                                        }
+                                        _ => {
+                                            proxy_wasm::hostcalls::log(
+                                                LogLevel::Warn, 
+                                                &format!("Unknown WAF action: {}", waf_response.action)
+                                            ).ok();
+                                            self.resume_http_request();
+                                            return;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    proxy_wasm::hostcalls::log(
+                                        LogLevel::Error, 
+                                        &format!("Failed to parse WAF response: {}", e)
+                                    ).ok();
+                                    // Allow request on parse error
+                                    self.resume_http_request();
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    // No body, assume allow
+                    self.resume_http_request();
+                }
+                "403" => {
+                    proxy_wasm::hostcalls::log(LogLevel::Info, "WAF returned 403 - blocking request").ok();
                     self.send_http_response(
                         self.config.response_code as u32,
                         vec![("content-type", "text/plain")],
                         Some(self.config.response_message.as_bytes()),
                     );
-                    return Action::Pause;
+                }
+                "500" => {
+                    proxy_wasm::hostcalls::log(LogLevel::Error, "WAF internal error - allowing request").ok();
+                    // TODO: Check APPSEC_FAILURE_ACTION config parameter
+                    self.resume_http_request();
+                }
+                "401" => {
+                    proxy_wasm::hostcalls::log(LogLevel::Error, "WAF authentication failed - check API key").ok();
+                    // Allow request on auth error (could be configured differently)
+                    self.resume_http_request();
+                }
+                _ => {
+                    proxy_wasm::hostcalls::log(
+                        LogLevel::Warn, 
+                        &format!("Unexpected WAF response status: {}", status)
+                    ).ok();
+                    self.resume_http_request();
                 }
             }
         } else {
-            proxy_wasm::hostcalls::log(LogLevel::Info, "Could not get source address").ok();
+            proxy_wasm::hostcalls::log(LogLevel::Error, "No status in WAF response").ok();
+            self.resume_http_request();
         }
-
-        Action::Continue
     }
 }
 
@@ -395,4 +846,48 @@ fn parse_ip_from_bytes(bytes: &[u8]) -> Option<IpAddr> {
         return ip_str.parse::<IpAddr>().ok();
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::FilterConfig;
+
+    #[test]
+    fn test_waf_url_parsing() {
+        // Test basic URL parsing
+        let result = CrowdsecFilterHttp::parse_waf_url_static("http://crowdsec_waf/waf").unwrap();
+        assert_eq!(result.0, "crowdsec_waf"); // cluster
+        assert_eq!(result.1, "/waf"); // path
+        assert_eq!(result.2, "crowdsec_waf"); // authority
+        
+        // Test URL with port
+        let result = CrowdsecFilterHttp::parse_waf_url_static("http://crowdsec:7422/waf").unwrap();
+        assert_eq!(result.0, "crowdsec"); // cluster (host part only)
+        assert_eq!(result.1, "/waf"); // path
+        assert_eq!(result.2, "crowdsec:7422"); // authority (host:port)
+        
+        // Test URL without path
+        let result = CrowdsecFilterHttp::parse_waf_url_static("http://waf_service").unwrap();
+        assert_eq!(result.0, "waf_service"); // cluster
+        assert_eq!(result.1, "/"); // default path
+        assert_eq!(result.2, "waf_service"); // authority
+        
+        // Test URL caching in constructor
+        let mut config = FilterConfig::default();
+        config.waf_enabled = true;
+        config.waf_url = "http://crowdsec_waf/waf".to_string();
+        
+        let http_context = CrowdsecFilterHttp::new(
+            Rc::new(RefCell::new(IpStorage::new())),
+            config,
+        );
+        
+        // Verify URL parts were cached
+        assert!(http_context.waf_url_parts.is_some());
+        let cached_parts = http_context.waf_url_parts.as_ref().unwrap();
+        assert_eq!(cached_parts.0, "crowdsec_waf");
+        assert_eq!(cached_parts.1, "/waf");
+        assert_eq!(cached_parts.2, "crowdsec_waf");
+    }
 }

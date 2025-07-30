@@ -17,9 +17,11 @@ services:
       - ./../rust_updater/target/wasm32-wasip1/debug/crowdsec_updater.wasm:/etc/envoy/crowdsec_updater.wasm
       - ./certs:/etc/envoy/certs:ro
     command: >
-      envoy -c /etc/envoy/envoy.yaml --concurrency 10 --log-level debug
+      envoy -c /etc/envoy/envoy.yaml --concurrency 2 --log-level debug
   openresty:
     image: openresty/openresty:alpine
+    volumes:
+      - ./nginx.conf:/usr/local/openresty/nginx/conf/nginx.conf:ro
     ports:
       - "8080:80"
   crowdsec:

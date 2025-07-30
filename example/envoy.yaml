@@ -67,6 +67,13 @@ static_resources:
                       singleton_name: "crowdsec_singleton"
                       response_code: 403
                       response_message: "Forbidden: Your IP is banned."
+                      
+                      # WAF configuration
+                      waf_enabled: true
+                      waf_forward_on_decision: false
+                      waf_url: "http://crowdsec_waf/waf"
+                      waf_api_key: "thisisabouncerkey"
+                      waf_timeout_ms: 700
                   vm_config:
                     runtime: "envoy.wasm.runtime.v8"
                     vm_id: "crowdsec_filter"
@@ -127,3 +134,16 @@ static_resources:
               socket_address:
                 address: crowdsec
                 port_value: 8080
+  - name: crowdsec_waf
+    type: LOGICAL_DNS
+    # Comment out the following line to test on v6 networks
+    dns_lookup_family: V4_ONLY
+    load_assignment:
+      cluster_name: crowdsec_waf
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: crowdsec
+                port_value: 7422
