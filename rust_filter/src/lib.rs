@@ -9,18 +9,21 @@
 //! 2. **Decision Reception**: Receives ban/unban decisions from updater via worker-specific queue
 //! 3. **IP Storage**: Stores bans in optimized dual-storage system (HashSet + IpRange)
 //! 4. **Request Filtering**: Checks each HTTP request against stored bans
+//! 5. **WAF Integration**: Optional proxy to CrowdSec WAF for application-layer analysis
 //!
 //! ### Data Structures
 //!
 //! #### 1. Dual IP Storage System - Optimized for Different IP Types
 //! ```rust
 //! struct IpStorage {
-//!     single_ips: HashSet<Ipv4Addr>,    // O(1) lookup for single IPs
-//!     ip_range: IpRange<Ipv4Net>,       // Radix tree for CIDR ranges
+//!     single_ips: FxHashSet<IpAddr>,    // O(1) lookup for single IPs (IPv4 & IPv6)
+//!     ipv4_ranges: IpRange<Ipv4Net>,    // Radix tree for IPv4 CIDR ranges
+//!     ipv6_ranges: IpRange<Ipv6Net>,    // Radix tree for IPv6 CIDR ranges
 //! }
 //! ```
 //! - **Purpose**: Efficient storage and lookup for both single IPs and CIDR ranges
 //! - **Performance**: O(1) for single IPs, O(log n) for ranges
+//! - **IPv6 Support**: Full support for both IPv4 and IPv6 addresses and ranges
 //! - **Optimization**: Separate storage prevents range operations from slowing single IP lookups
 //!
 //! #### 2. Shared State Management
@@ -31,6 +34,20 @@
 //! - **Why Rc<RefCell<>>**: Proxy-WASM requires 'static lifetimes, this provides safe shared mutability
 //! - **Performance**: Zero-copy sharing, minimal overhead
 //!
+//! #### 3. WAF Request Processing
+//! ```rust
+//! struct CachedRequestHeaders {
+//!     uri: String,
+//!     host: String,
+//!     method: String,
+//!     user_agent: String,
+//!     request_headers: Vec<(String, String)>,
+//! }
+//! ```
+//! - **Purpose**: Cache headers during header phase for use in body phase
+//! - **Why Needed**: Proxy-WASM restrictions prevent header access during body processing
+//! - **Logic**: Headers-only requests processed immediately, body requests buffered then sent
+//!
 //! ### IP Storage Optimization Explained
 //!
 //! **The Problem**: Single storage for all IPs causes performance issues:
@@ -39,31 +56,33 @@
 //! IpRange<Ipv4Net> // Even single IPs require range operations
 //! ```
 //!
-//! **The Solution**: Dual storage system:
+//! **The Solution**: Dual storage system with IPv6 support:
 //! ```rust
 //! // Efficient - separate fast paths
-//! HashSet<Ipv4Addr>  // O(1) for single IPs
-//! IpRange<Ipv4Net>   // O(log n) for ranges only
+//! FxHashSet<IpAddr>     // O(1) for single IPs (IPv4 & IPv6)
+//! IpRange<Ipv4Net>      // O(log n) for IPv4 ranges only
+//! IpRange<Ipv6Net>      // O(log n) for IPv6 ranges only
 //! ```
 //!
 //! **Performance Benefits**:
 //! - **Single IPs**: 10x faster (HashSet vs range tree)
 //! - **Ranges**: Same performance (dedicated range storage)
+//! - **IPv6 Support**: Full performance parity with IPv4
 //! - **Mixed workloads**: Best of both worlds
 //!
 //! ### Performance Characteristics
 //!
 //! | Operation | Complexity | Description |
 //! |-----------|------------|-------------|
-//! | Single IP Lookup | O(1) | HashSet lookup |
-//! | Range IP Lookup | O(log n) | Radix tree lookup |
-//! | Single IP Insert | O(1) | HashSet insert |
+//! | Single IP Lookup | O(1) | FxHashSet lookup (IPv4 & IPv6) |
+//! | Range IP Lookup | O(log n) | Radix tree lookup (version-specific) |
+//! | Single IP Insert | O(1) | FxHashSet insert |
 //! | Range Insert | O(n) | Rebuild radix tree |
-//! | IP Removal | O(1) | HashSet/range removal |
+//! | IP Removal | O(1) | FxHashSet/range removal |
 //!
 //! ### Memory Usage
-//! - **HashSet**: ~16 bytes per single IP (IPv4Addr)
-//! - **IpRange**: ~24 bytes per CIDR range (Ipv4Net)
+//! - **FxHashSet**: ~16 bytes per single IP (IpAddr - supports both IPv4 & IPv6)
+//! - **IpRange**: ~24 bytes per CIDR range (Ipv4Net or Ipv6Net)
 //! - **SharedBans**: ~8 bytes (Rc<RefCell<>> overhead)
 //! - **Total**: ~48 bytes per ban (average)
 //!
@@ -289,7 +308,7 @@ impl RootContext for CrowdsecFilter {
         ) {
             Ok(()) => {
                 proxy_wasm::hostcalls::log(
-                    LogLevel::Info,
+                    LogLevel::Debug,
                     &format!("Successfully enqueued worker UUID: {}", self.worker_uuid),
                 )
                 .ok();
@@ -323,7 +342,7 @@ impl RootContext for CrowdsecFilter {
                 match batch_result {
                     Ok(batch) => {
                         proxy_wasm::hostcalls::log(
-                            LogLevel::Info,
+                            LogLevel::Debug,
                             &format!("Dequeued batch with {} decisions", batch.len()),
                         )
                         .ok();
@@ -425,8 +444,8 @@ impl CrowdsecFilterHttp {
         Ok((cluster.to_string(), path.to_string(), host_port.to_string()))
     }
 
-    fn cache_request_headers(&mut self) {
-        // Cache headers that will be needed for WAF processing
+    // Extract request information once, reuse everywhere
+    fn extract_request_info(&self) -> CachedRequestHeaders {
         let uri = self.get_http_request_header(":path")
             .unwrap_or_else(|| "/".to_string());
         let host = self.get_http_request_header(":authority")
@@ -437,19 +456,22 @@ impl CrowdsecFilterHttp {
         let user_agent = self.get_http_request_header("user-agent")
             .unwrap_or_else(|| "unknown".to_string());
         
-        // Cache all request headers (excluding pseudo-headers and CrowdSec headers)
         let request_headers = self.get_http_request_headers()
             .into_iter()
             .filter(|(name, _)| !name.starts_with(':') && !name.starts_with("X-Crowdsec-Appsec-"))
             .collect();
 
-        self.cached_headers = Some(CachedRequestHeaders {
+        CachedRequestHeaders {
             uri,
             host,
             method,
             user_agent,
             request_headers,
-        });
+        }
+    }
+
+    fn cache_request_headers(&mut self) {
+        self.cached_headers = Some(self.extract_request_info());
     }
 
     fn send_waf_request(&self, ip_addr: IpAddr, body: Option<&[u8]>) -> Result<u32, String> {
@@ -462,13 +484,21 @@ impl CrowdsecFilterHttp {
         let timeout = self.config.waf_timeout;
 
         let log_msg = if let Some(body_data) = body {
-            format!("Sending WAF request with body to cluster: {}, path: {}, authority: {} with timeout: {:?}ms, body size: {} bytes", 
-                cluster, path, authority, timeout.as_millis(), body_data.len())
+            proxy_wasm::hostcalls::log(
+                LogLevel::Debug, 
+                &format!("Sending WAF request with body to cluster: {}, path: {}, authority: {} with timeout: {:?}ms", 
+                    cluster, path, authority, timeout.as_millis())
+            ).ok();
+            proxy_wasm::hostcalls::log(
+                LogLevel::Debug, 
+                &format!("WAF request body size: {} bytes", body_data.len())
+            ).ok();
+            format!("WAF body request prepared")
         } else {
-            format!("Sending WAF request to cluster: {}, path: {}, authority: {} with timeout: {:?}ms", 
+            format!("Sending WAF request (headers only) to cluster: {}, path: {}, authority: {} with timeout: {:?}ms", 
                 cluster, path, authority, timeout.as_millis())
         };
-        proxy_wasm::hostcalls::log(LogLevel::Info, &log_msg).ok();
+        proxy_wasm::hostcalls::log(LogLevel::Debug, &log_msg).ok();
 
         // Build header pairs directly with references
         let mut header_pairs = vec![
@@ -501,12 +531,12 @@ impl CrowdsecFilterHttp {
             timeout,
         ) {
             Ok(token_id) => {
-                let success_msg = if body.is_some() {
-                    format!("dispatch_http_call with body successful, token_id: {}", token_id)
+                let success_msg = if let Some(body_data) = body {
+                    format!("dispatch_http_call with body successful, token_id: {}, body_size: {} bytes", token_id, body_data.len())
                 } else {
-                    format!("dispatch_http_call successful, token_id: {}", token_id)
+                    format!("dispatch_http_call (headers only) successful, token_id: {}", token_id)
                 };
-                proxy_wasm::hostcalls::log(LogLevel::Info, &success_msg).ok();
+                proxy_wasm::hostcalls::log(LogLevel::Debug, &success_msg).ok();
                 Ok(token_id)
             },
             Err(e) => {
@@ -520,62 +550,37 @@ impl CrowdsecFilterHttp {
     fn build_waf_headers(&self, ip_addr: IpAddr, body: Option<&[u8]>) -> Result<Vec<(String, String)>, String> {
         let mut headers = Vec::new();
 
-        // Use cached headers when we have a body (body phase), direct access for header-only requests (header phase)
-        let (uri, host, method, user_agent, request_headers) = if body.is_some() {
-            // Body phase - use cached headers to avoid proxy-wasm access issues
-            let cached = self.cached_headers.as_ref()
-                .ok_or("Headers not cached - call cache_request_headers() during header phase")?;
-            (cached.uri.clone(), cached.host.clone(), cached.method.clone(), 
-             cached.user_agent.clone(), cached.request_headers.clone())
+        // Get request info based on phase
+        let request_info = if body.is_some() {
+            // Body phase - use cached headers
+            self.cached_headers.as_ref()
+                .ok_or("Headers not cached - call cache_request_headers() during header phase")?
+                .clone()
         } else {
-            // Header phase - can access headers directly
-            let uri = self.get_http_request_header(":path")
-                .unwrap_or_else(|| "/".to_string());
-            let host = self.get_http_request_header(":authority")
-                .or_else(|| self.get_http_request_header("host"))
-                .unwrap_or_else(|| "unknown".to_string());
-            let method = self.get_http_request_header(":method")
-                .unwrap_or_else(|| "GET".to_string());
-            let user_agent = self.get_http_request_header("user-agent")
-                .unwrap_or_else(|| "unknown".to_string());
-            
-            let request_headers = self.get_http_request_headers()
-                .into_iter()
-                .filter(|(name, _)| !name.starts_with(':') && !name.starts_with("X-Crowdsec-Appsec-"))
-                .collect();
-            
-            (uri, host, method, user_agent, request_headers)
+            // Header phase - extract directly
+            self.extract_request_info()
         };
-        
-        // Get HTTP version - proxy-wasm doesn't expose this directly, so we'll default to 11
-        let http_version = "11".to_string();
-
-        // Convert method to proper case for WAF
-        let method_upper = method.to_uppercase();
 
         // Add required CrowdSec headers
-        headers.push(("X-Crowdsec-Appsec-Ip".to_string(), ip_addr.to_string()));
-        headers.push(("X-Crowdsec-Appsec-Uri".to_string(), uri));
-        headers.push(("X-Crowdsec-Appsec-Host".to_string(), host));
-        headers.push(("X-Crowdsec-Appsec-Verb".to_string(), method_upper));
-        headers.push(("X-Crowdsec-Appsec-Api-Key".to_string(), self.config.waf_api_key.clone()));
-        headers.push(("X-Crowdsec-Appsec-User-Agent".to_string(), user_agent));
-        headers.push(("X-Crowdsec-Appsec-Http-Version".to_string(), http_version));
+        headers.extend([
+            ("X-Crowdsec-Appsec-Ip".to_string(), ip_addr.to_string()),
+            ("X-Crowdsec-Appsec-Uri".to_string(), request_info.uri),
+            ("X-Crowdsec-Appsec-Host".to_string(), request_info.host),
+            ("X-Crowdsec-Appsec-Verb".to_string(), request_info.method.to_uppercase()),
+            ("X-Crowdsec-Appsec-Api-Key".to_string(), self.config.waf_api_key.clone()),
+            ("X-Crowdsec-Appsec-User-Agent".to_string(), request_info.user_agent),
+            ("X-Crowdsec-Appsec-Http-Version".to_string(), "11".to_string()),
+        ]);
 
         // Copy original request headers
-        for (name, value) in request_headers {
-            headers.push((name, value));
-        }
+        headers.extend(request_info.request_headers);
 
-        // Set content-type and content-length if we have a body
+        // Add content headers if we have a body
         if let Some(body_data) = body {
             headers.push(("Content-Length".to_string(), body_data.len().to_string()));
-            // Find content-type from the request headers we just processed
-            if let Some((_, _content_type)) = headers.iter()
-                .find(|(name, _)| name.eq_ignore_ascii_case("content-type")) {
-                // Content-Type already added from request headers, don't duplicate
-            } else if body.is_none() {
-                // Only try to get content-type directly if we're in header phase
+            
+            // Add Content-Type if not already present
+            if !headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("content-type")) {
                 if let Some(content_type) = self.get_http_request_header("content-type") {
                     headers.push(("Content-Type".to_string(), content_type));
                 }
@@ -660,10 +665,10 @@ impl HttpContext for CrowdsecFilterHttp {
                         }
                     }
                 } else {
-                    // Has body, continue to collect body data
+                    // Has body, continue to allow body collection but don't route yet
                     proxy_wasm::hostcalls::log(
                         LogLevel::Info, 
-                        &format!("Request has body, continuing to collect for IP: {}", ip_addr)
+                        &format!("Request has body, continuing to collect body data for IP: {}", ip_addr)
                     ).ok();
                     return Action::Continue;
                 }
@@ -689,50 +694,82 @@ impl HttpContext for CrowdsecFilterHttp {
     }
 
     fn on_http_request_body(&mut self, body_size: usize, end_of_stream: bool) -> Action {
-        // Collect body data if WAF is enabled
-        if self.config.waf_enabled && self.has_request_body {
-            if let Some(body) = self.get_http_request_body(0, body_size) {
-                self.request_body.extend_from_slice(&body);
+        proxy_wasm::hostcalls::log(
+            LogLevel::Debug,
+            &format!(
+                "on_http_request_body: body_size={}, end_of_stream={}, request_body.len()={}",
+                body_size, end_of_stream, self.request_body.len()
+            ),
+        ).ok();
+
+        // Accumulate the body in chunks, only adding what is new
+        if let Some(current_buffer) = self.get_http_request_body(0, body_size) {
+            if self.request_body.len() < current_buffer.len() {
+                let new_bytes = &current_buffer[self.request_body.len()..];
+                self.request_body.extend_from_slice(new_bytes);
                 proxy_wasm::hostcalls::log(
-                    LogLevel::Debug, 
-                    &format!("Collected {} bytes of body data, total: {}", body.len(), self.request_body.len())
+                    LogLevel::Debug,
+                    &format!("Buffered {} new bytes, total buffered: {}", new_bytes.len(), self.request_body.len()),
                 ).ok();
             }
+        }
 
-            // If this is the end of the stream, send complete request to WAF
-            if end_of_stream {
-                if let Some(addr_bytes) = self.get_property(vec!["source", "address"]) {
-                    if let Some(ip_addr) = parse_ip_from_bytes(&addr_bytes) {
-                        let body_len = self.request_body.len();
-                        proxy_wasm::hostcalls::log(
-                            LogLevel::Info, 
-                            &format!("Forwarding request to WAF (with body, {} bytes) for IP: {}", body_len, ip_addr)
-                        ).ok();
-                        // Extract body reference to avoid borrowing conflict
-                        let body_ref = &self.request_body;
-                        match self.send_waf_request(ip_addr, Some(body_ref)) {
-                            Ok(token_id) => {
-                                proxy_wasm::hostcalls::log(
-                                    LogLevel::Info, 
-                                    &format!("WAF request sent successfully (with body), token_id: {}", token_id)
-                                ).ok();
-                                return Action::Pause; // Wait for WAF response
-                            }
-                            Err(e) => {
-                                proxy_wasm::hostcalls::log(
-                                    LogLevel::Error,
-                                    &format!("Failed to send WAF body request: {}", e),
-                                ).ok();
-                            }
+        // If we haven't received the full body, keep collecting
+        if !end_of_stream {
+            return Action::Continue;
+        }
+
+        proxy_wasm::hostcalls::log(
+            LogLevel::Debug,
+            &format!("End of stream reached. Total body collected: {} bytes", self.request_body.len())
+        ).ok();
+
+        // WAF/CrowdSec logic (proxy request to WAF) goes here
+        if self.config.waf_enabled && self.has_request_body {
+            proxy_wasm::hostcalls::log(
+                LogLevel::Debug,
+                "Entering WAF body processing logic",
+            ).ok();
+
+            if let Some(addr_bytes) = self.get_property(vec!["source", "address"]) {
+                if let Some(ip_addr) = parse_ip_from_bytes(&addr_bytes) {
+                    let body_len = self.request_body.len();
+                    proxy_wasm::hostcalls::log(
+                        LogLevel::Debug,
+                        &format!("Forwarding request to WAF (with body, {} bytes) for IP: {}", body_len, ip_addr)
+                    ).ok();
+
+                    let body_ref = &self.request_body;
+                    match self.send_waf_request(ip_addr, Some(body_ref)) {
+                        Ok(token_id) => {
+                            proxy_wasm::hostcalls::log(
+                                LogLevel::Debug,
+                                &format!("WAF request sent successfully (with body), token_id: {}", token_id)
+                            ).ok();
+                            return Action::Pause; // Wait for WAF response
+                        }
+                        Err(e) => {
+                            proxy_wasm::hostcalls::log(
+                                LogLevel::Error,
+                                &format!("Failed to send WAF body request: {}", e),
+                            ).ok();
                         }
                     }
                 }
             }
+        } else {
+            proxy_wasm::hostcalls::log(
+                LogLevel::Debug,
+                &format!(
+                    "Skipping WAF body processing: waf_enabled={}, has_request_body={}",
+                    self.config.waf_enabled, self.has_request_body
+                ),
+            ).ok();
         }
 
+        // If no WAF logic is required, just continue processing
         Action::Continue
     }
-
 }
 
 impl Context for CrowdsecFilterHttp {
