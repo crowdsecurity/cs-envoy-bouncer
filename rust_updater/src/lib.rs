@@ -13,11 +13,12 @@
 //!
 //! #### 1. BanMessage HashMap - O(1) Fast Lookup
 //! ```rust
-//! HashMap<String, BanMessage> // IP -> ban information
+//! HashMap<IpNet, BanMessage> // IpNet -> ban information
 //! ```
 //! - **Purpose**: Fast IP lookup for checking if an IP is banned
 //! - **Performance**: O(1) average case for insertions and lookups
-//! - **Contains**: IP, remediation type, and whether it's a CIDR range
+//! - **Contains**: IP (as IpNet), remediation type, and expiration string
+//! - **IPv6 Support**: Full support for both IPv4 and IPv6 addresses and ranges
 //!
 //! #### 2. BinaryHeap Priority Queue - O(log n) Expiration Management
 //! ```rust
@@ -26,8 +27,16 @@
 //! - **Purpose**: Efficiently track and process expiring bans (fallback mode only)
 //! - **Performance**: O(1) to check next expiration, O(log n) to add/remove
 //! - **Optimization**: Only checks the next expiring ban instead of scanning all bans
-//! - **Memory**: Stores IP strings directly to avoid complex indexing
+//! - **Memory**: Stores IpNet directly for simplicity and reliability
 //! - **Hybrid**: Only active when LAPI is unavailable (local fallback)
+//!
+//! #### 3. Batch Removal Tracking
+//! ```rust
+//! HashSet<IpNet> // Track IPNets to remove for lazy cleanup
+//! ```
+//! - **Purpose**: Efficiently handle multiple deletions without rebuilding queue on each removal
+//! - **Performance**: O(1) marking, O(k) batch rebuild where k = queue size
+//! - **Optimization**: Batch rebuild instead of individual removals
 //!
 //! ### Performance Characteristics
 //!
@@ -35,9 +44,10 @@
 //! |-----------|------------|-------------|
 //! | IP Lookup | O(1) | HashMap lookup |
 //! | Add Ban | O(log n) | HashMap insert + BinaryHeap insert |
-//! | Remove Ban | O(n) | HashMap remove + BinaryHeap rebuild |
+//! | Remove Ban | O(1) | Mark for removal (batch rebuild) |
 //! | Check Expiration | O(1) | BinaryHeap peek |
 //! | Process Expired | O(k log n) | Where k = number of expired bans |
+//! | Batch Rebuild | O(k) | Rebuild queue once after all deletions |
 //!
 //! For detailed documentation including diagrams and step-by-step workflow, see README.md
 
