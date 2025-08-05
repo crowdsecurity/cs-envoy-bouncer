@@ -309,8 +309,7 @@ impl CrowdsecUpdater {
         }
 
         // LAPI call was successful - process response
-        if let Some(body) = self.get_http_call_response_body(0, 100 * 1024 * 1024) {
-            // 100MB max
+        if let Some(body) = self.get_http_call_response_body(0, self.config.max_response_body_size) {
             if body.is_empty() {
                 proxy_wasm::hostcalls::log(LogLevel::Debug, "Empty response from LAPI").ok();
                 return;

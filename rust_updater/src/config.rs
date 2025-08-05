@@ -31,6 +31,9 @@ pub struct Config {
 
     #[serde(default = "default_lapi_timeout")]
     pub lapi_timeout: u64,
+
+    #[serde(default = "default_max_response_body_size")]
+    pub max_response_body_size: usize,
 }
 
 /// Consolidated configuration for the CrowdSec updater
@@ -45,6 +48,7 @@ pub struct UpdaterConfig {
     pub scenarios_containing: Vec<String>,
     pub scenarios_not_containing: Vec<String>,
     pub lapi_timeout: Duration,
+    pub max_response_body_size: usize,
 }
 
 impl From<Config> for UpdaterConfig {
@@ -59,6 +63,7 @@ impl From<Config> for UpdaterConfig {
             scenarios_containing: config.scenarios_containing,
             scenarios_not_containing: config.scenarios_not_containing,
             lapi_timeout: Duration::from_secs(config.lapi_timeout),
+            max_response_body_size: config.max_response_body_size,
         }
     }
 }
@@ -98,6 +103,7 @@ impl Default for UpdaterConfig {
             scenarios_containing: Vec::new(),
             scenarios_not_containing: Vec::new(),
             lapi_timeout: Duration::from_secs(10),
+            max_response_body_size: 10 * 1024 * 1024, // 10MB default
         }
     }
 }
@@ -113,6 +119,9 @@ fn default_crowdsec_url() -> String {
 }
 fn default_lapi_timeout() -> u64 {
     10
+}
+fn default_max_response_body_size() -> usize {
+    10 * 1024 * 1024 // 10MB
 }
 
 pub fn parse_config(config_bytes: &[u8]) -> Result<UpdaterConfig, Box<dyn std::error::Error>> {
