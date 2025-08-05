@@ -108,7 +108,7 @@ proxy_wasm::main! {{
 
 impl CrowdsecUpdater {
     fn broadcast_decisions(&self, decisions: &[BanMessage]) {
-        let batches = match send_batched(decisions) {
+        let batches = match send_batched(decisions, self.config.batch_size, self.config.max_batch_bytes) {
             Ok(batches) => batches,
             Err(e) => {
                 proxy_wasm::hostcalls::log(

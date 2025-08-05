@@ -3,8 +3,6 @@ use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const MAX_BATCH_BYTES: usize = 12 * 1024; // 12KB, safe for ABI, make configurable if needed
-const BATCH_SIZE: usize = 1000; // We should make it configurable
 
 // this is a workaround for the fact that the json is sometimes null
 // and we need to make sure that the vec is empty if the json is null
@@ -70,6 +68,8 @@ impl Ord for ExpirationEntry {
 // Utility functions
 pub fn send_batched(
     messages: &[BanMessage],
+    batch_size: usize,
+    max_batch_bytes: usize,
 ) -> Result<Vec<Vec<BanMessage>>, Box<dyn std::error::Error>> {
     if messages.is_empty() {
         return Ok(Vec::new());
@@ -83,8 +83,8 @@ pub fn send_batched(
         let msg_bytes =
             flexbuffers::to_vec(msg).map_err(|e| format!("Failed to serialize message: {}", e))?;
 
-        if current_batch_size + msg_bytes.len() > MAX_BATCH_BYTES
-            || current_batch.len() >= BATCH_SIZE
+        if current_batch_size + msg_bytes.len() > max_batch_bytes
+            || current_batch.len() >= batch_size
         {
             // Send current batch
             if !current_batch.is_empty() {

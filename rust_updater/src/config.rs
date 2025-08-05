@@ -34,6 +34,12 @@ pub struct Config {
 
     #[serde(default = "default_max_response_body_size")]
     pub max_response_body_size: usize,
+
+    #[serde(default = "default_batch_size")]
+    pub batch_size: usize,
+
+    #[serde(default = "default_max_batch_bytes")]
+    pub max_batch_bytes: usize,
 }
 
 /// Consolidated configuration for the CrowdSec updater
@@ -49,6 +55,8 @@ pub struct UpdaterConfig {
     pub scenarios_not_containing: Vec<String>,
     pub lapi_timeout: Duration,
     pub max_response_body_size: usize,
+    pub batch_size: usize,
+    pub max_batch_bytes: usize,
 }
 
 impl From<Config> for UpdaterConfig {
@@ -64,6 +72,8 @@ impl From<Config> for UpdaterConfig {
             scenarios_not_containing: config.scenarios_not_containing,
             lapi_timeout: Duration::from_secs(config.lapi_timeout),
             max_response_body_size: config.max_response_body_size,
+            batch_size: config.batch_size,
+            max_batch_bytes: config.max_batch_bytes,
         }
     }
 }
@@ -104,6 +114,8 @@ impl Default for UpdaterConfig {
             scenarios_not_containing: Vec::new(),
             lapi_timeout: Duration::from_secs(10),
             max_response_body_size: 10 * 1024 * 1024, // 10MB default
+            batch_size: 1000,
+            max_batch_bytes: 12 * 1024, // 12KB
         }
     }
 }
@@ -122,6 +134,12 @@ fn default_lapi_timeout() -> u64 {
 }
 fn default_max_response_body_size() -> usize {
     10 * 1024 * 1024 // 10MB
+}
+fn default_batch_size() -> usize {
+    1000
+}
+fn default_max_batch_bytes() -> usize {
+    12 * 1024 // 12KB
 }
 
 pub fn parse_config(config_bytes: &[u8]) -> Result<UpdaterConfig, Box<dyn std::error::Error>> {
