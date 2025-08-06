@@ -13,8 +13,8 @@ services:
       - "10000:10000"
     volumes:
       - ./envoy.yaml:/etc/envoy/envoy.yaml
-      - ./../rust_filter/target/wasm32-wasip1/debug/crowdsec_filter.wasm:/etc/envoy/crowdsec_filter.wasm
-      - ./../rust_updater/target/wasm32-wasip1/debug/crowdsec_updater.wasm:/etc/envoy/crowdsec_updater.wasm
+      - ./../filter/target/wasm32-wasip1/release/crowdsec_filter.wasm:/etc/envoy/crowdsec_filter.wasm
+      - ./../updater/target/wasm32-wasip1/release/crowdsec_updater.wasm:/etc/envoy/crowdsec_updater.wasm
       - ./certs:/etc/envoy/certs:ro
     command: >
       envoy -c /etc/envoy/envoy.yaml --concurrency 2 --log-level debug
