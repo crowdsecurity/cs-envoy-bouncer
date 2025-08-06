@@ -215,11 +215,7 @@ impl CrowdsecUpdater {
             return;
         }
 
-        let mut path = if self.is_startup {
-            "/v1/decisions/stream?startup=true".to_string()
-        } else {
-            "/v1/decisions/stream".to_string()
-        };
+        let mut path = "/v1/decisions/stream".to_string();
 
         // Build query parameters using core module
         let query_params = build_query_params(
@@ -230,8 +226,7 @@ impl CrowdsecUpdater {
             &self.config.scenarios_not_containing,
         );
         if !query_params.is_empty() {
-            let separator = if path.contains('?') { "&" } else { "?" };
-            path = format!("{}{}{}", path, separator, query_params);
+            path = format!("{}{}", path, query_params);
         }
 
         self.is_startup = false;
