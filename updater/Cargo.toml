@@ -1,0 +1,28 @@
+[package]
+name = "crowdsec_updater"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+proxy-wasm = "0.2.3"
+serde_json = "1"
+serde_yaml = "0.9"
+serde = { version = "1", features = ["derive"] }
+flexbuffers = "25.2.10"
+log = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+ipnet = { version = "2.8", features = ["serde"] }
+
+[build-dependencies]
+vergen-git2 = { version = "1.0", features = ["build", "cargo"] }
+
+
+[profile.release]
+lto = true
+opt-level = 3
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo"
