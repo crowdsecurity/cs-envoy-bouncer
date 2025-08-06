@@ -695,32 +695,24 @@ impl HttpContext for CrowdsecFilterHttp {
         proxy_wasm::hostcalls::log(
             LogLevel::Debug,
             &format!(
-                "on_http_request_body: body_size={}, end_of_stream={}, request_body.len()={}",
-                body_size, end_of_stream, self.request_body.len()
+                "on_http_request_body: body_size={}, end_of_stream={}",
+                body_size, end_of_stream
             ),
         ).ok();
 
-        // Accumulate the body in chunks, only adding what is new
-        if let Some(current_buffer) = self.get_http_request_body(0, body_size) {
-            if self.request_body.len() < current_buffer.len() {
-                let new_bytes = &current_buffer[self.request_body.len()..];
-                self.request_body.extend_from_slice(new_bytes);
-                proxy_wasm::hostcalls::log(
-                    LogLevel::Debug,
-                    &format!("Buffered {} new bytes, total buffered: {}", new_bytes.len(), self.request_body.len()),
-                ).ok();
-            }
-        }
-
-        // If we haven't received the full body, keep collecting
         if !end_of_stream {
-            return Action::Continue;
+            // Let Envoy buffer the complete body at the host side
+            return Action::Pause;
         }
 
-        proxy_wasm::hostcalls::log(
-            LogLevel::Debug,
-            &format!("End of stream reached. Total body collected: {} bytes", self.request_body.len())
-        ).ok();
+        // Get the complete body in one shot
+        if let Some(complete_body) = self.get_http_request_body(0, body_size) {
+            self.request_body = complete_body;
+            proxy_wasm::hostcalls::log(
+                LogLevel::Debug,
+                &format!("Complete body received: {} bytes", self.request_body.len())
+            ).ok();
+        }
 
         // WAF/CrowdSec logic (proxy request to WAF) goes here
         if self.config.waf_enabled && self.has_request_body {
@@ -834,6 +826,10 @@ impl Context for CrowdsecFilterHttp {
                 "500" => {
                     proxy_wasm::hostcalls::log(LogLevel::Error, "WAF internal error - allowing request").ok();
                     // TODO: Check APPSEC_FAILURE_ACTION config parameter
+                    self.resume_http_request();
+                }
+                "504" => {
+                    proxy_wasm::hostcalls::log(LogLevel::Warn, &format!("WAF request timed out ({}ms) - allowing request", self.config.waf_timeout.as_millis())).ok();
                     self.resume_http_request();
                 }
                 "401" => {
