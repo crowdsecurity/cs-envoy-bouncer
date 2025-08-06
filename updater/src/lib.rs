@@ -99,6 +99,7 @@ impl Default for CrowdsecUpdater {
 }
 
 const STR_WORKER_NAMES_QUEUE: &str = "crowdsec_worker_names";
+const USER_AGENT: &str = concat!("cs-envoy-bouncer/", env!("VERGEN_GIT_DESCRIBE"));
 
 proxy_wasm::main! {{
     proxy_wasm::set_log_level(LogLevel::Trace);
@@ -236,6 +237,7 @@ impl CrowdsecUpdater {
             (":path", &path),
             (":authority", "crowdsec"),
             ("x-api-key", &self.config.api_key),
+            ("user-agent", USER_AGENT),
         ];
 
         info!("Asking the crowdsec LAPI for decisions {path}");

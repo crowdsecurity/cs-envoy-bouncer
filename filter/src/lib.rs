@@ -90,6 +90,8 @@
 
 mod config;
 
+const USER_AGENT: &str = concat!("cs-envoy-bouncer/", env!("VERGEN_GIT_DESCRIBE"));
+
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use iprange::IpRange;
 use proxy_wasm::traits::*;
@@ -565,6 +567,7 @@ impl CrowdsecFilterHttp {
             ("X-Crowdsec-Appsec-Api-Key".to_string(), self.config.waf_api_key.clone()),
             ("X-Crowdsec-Appsec-User-Agent".to_string(), request_info.user_agent),
             ("X-Crowdsec-Appsec-Http-Version".to_string(), "11".to_string()),
+            ("User-Agent".to_string(), USER_AGENT.to_string()),
         ]);
 
         // Copy original request headers
@@ -775,19 +778,19 @@ impl Context for CrowdsecFilterHttp {
         if let Some(status) = self.get_http_call_response_header(":status") {
             match status.as_str() {
                 "200" => {
-                    // Request allowed - parse JSON response
+                    // WAF allowed request - continue
+                    proxy_wasm::hostcalls::log(LogLevel::Debug, "WAF allowed request").ok();
+                    self.resume_http_request();
+                }
+                "403" => {
+                    proxy_wasm::hostcalls::log(LogLevel::Info, "WAF returned 403 - blocking request").ok();
+                    // Parse JSON response like we do for 200
                     if body_size > 0 {
                         if let Some(response_body) = self.get_http_call_response_body(0, body_size) {
                             match self.parse_waf_response(&response_body) {
                                 Ok(waf_response) => {
                                     match waf_response.action.as_str() {
-                                        "allow" => {
-                                            proxy_wasm::hostcalls::log(LogLevel::Debug, "WAF allowed request").ok();
-                                            self.resume_http_request();
-                                            return;
-                                        }
                                         "ban" => {
-                                            proxy_wasm::hostcalls::log(LogLevel::Info, "WAF banned request").ok();
                                             let status_code = waf_response.http_status.unwrap_or(403);
                                             self.send_http_response(
                                                 status_code as u32,
@@ -797,7 +800,6 @@ impl Context for CrowdsecFilterHttp {
                                             return;
                                         }
                                         "captcha" => {
-                                            proxy_wasm::hostcalls::log(LogLevel::Info, "WAF requires captcha").ok();
                                             let status_code = waf_response.http_status.unwrap_or(403);
                                             self.send_http_response(
                                                 status_code as u32,
@@ -807,36 +809,26 @@ impl Context for CrowdsecFilterHttp {
                                             return;
                                         }
                                         _ => {
-                                            proxy_wasm::hostcalls::log(
-                                                LogLevel::Warn, 
-                                                &format!("Unknown WAF action: {}", waf_response.action)
-                                            ).ok();
-                                            self.resume_http_request();
+                                            self.send_http_response(
+                                                403,
+                                                vec![("content-type", "text/plain")],
+                                                Some(b"Forbidden: Request blocked by WAF"),
+                                            );
                                             return;
                                         }
                                     }
                                 }
-                                Err(e) => {
-                                    proxy_wasm::hostcalls::log(
-                                        LogLevel::Error, 
-                                        &format!("Failed to parse WAF response: {}", e)
-                                    ).ok();
-                                    // Allow request on parse error
-                                    self.resume_http_request();
-                                    return;
+                                Err(_) => {
+                                    // Parse error, use default
                                 }
                             }
                         }
                     }
-                    // No body, assume allow
-                    self.resume_http_request();
-                }
-                "403" => {
-                    proxy_wasm::hostcalls::log(LogLevel::Info, "WAF returned 403 - blocking request").ok();
+                    // Fallback
                     self.send_http_response(
-                        self.config.response_code as u32,
+                        403,
                         vec![("content-type", "text/plain")],
-                        Some(self.config.response_message.as_bytes()),
+                        Some(b"Forbidden: Request blocked by WAF"),
                     );
                 }
                 "500" => {
