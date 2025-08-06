@@ -692,72 +692,90 @@ impl HttpContext for CrowdsecFilterHttp {
     }
 
     fn on_http_request_body(&mut self, body_size: usize, end_of_stream: bool) -> Action {
+        // If WAF is disabled, just continue without processing body
+        if !self.config.waf_enabled {
+            proxy_wasm::hostcalls::log(LogLevel::Debug, "WAF disabled, continuing request").ok();
+            return Action::Continue;
+        }
+
+        // If WAF is enabled but request has no body, continue
+        // if !self.has_request_body {
+        //     proxy_wasm::hostcalls::log(LogLevel::Debug, "No request body, continuing").ok();
+        //     return Action::Continue;
+        // }
+
         proxy_wasm::hostcalls::log(
             LogLevel::Debug,
             &format!(
-                "on_http_request_body: body_size={}, end_of_stream={}",
-                body_size, end_of_stream
+                "on_http_request_body: body_size={}, end_of_stream={}, current_buffer_len={}",
+                body_size, end_of_stream, self.request_body.len()
             ),
         ).ok();
 
+        // Get only the new chunk from where we left off
+        if body_size > self.request_body.len() {
+            let chunk_start = self.request_body.len();
+            let chunk_size = body_size - self.request_body.len();
+            
+            if let Some(new_chunk) = self.get_http_request_body(chunk_start, chunk_size) {
+                self.request_body.extend_from_slice(&new_chunk);
+                proxy_wasm::hostcalls::log(
+                    LogLevel::Debug,
+                    &format!("Read new chunk from offset {}, size: {} bytes, total: {} bytes", 
+                        chunk_start, new_chunk.len(), self.request_body.len())
+                ).ok();
+            }
+        }
+
         if !end_of_stream {
-            // Let Envoy buffer the complete body at the host side
+            // Pause until complete body is buffered at host side
+            proxy_wasm::hostcalls::log(
+                LogLevel::Debug,
+                "Pausing until complete body is collected..."
+            ).ok();
             return Action::Pause;
         }
 
-        // Get the complete body in one shot
-        if let Some(complete_body) = self.get_http_request_body(0, body_size) {
-            self.request_body = complete_body;
-            proxy_wasm::hostcalls::log(
-                LogLevel::Debug,
-                &format!("Complete body received: {} bytes", self.request_body.len())
-            ).ok();
-        }
+        // End of stream reached - we have the complete body
+        proxy_wasm::hostcalls::log(
+            LogLevel::Debug,
+            &format!("Complete body received via streaming: {} bytes", self.request_body.len())
+        ).ok();
 
-        // WAF/CrowdSec logic (proxy request to WAF) goes here
-        if self.config.waf_enabled && self.has_request_body {
-            proxy_wasm::hostcalls::log(
-                LogLevel::Debug,
-                "Entering WAF body processing logic",
-            ).ok();
+        // WAF processing logic
+        proxy_wasm::hostcalls::log(
+            LogLevel::Debug,
+            "Entering WAF body processing logic",
+        ).ok();
 
-            if let Some(addr_bytes) = self.get_property(vec!["source", "address"]) {
-                if let Some(ip_addr) = parse_ip_from_bytes(&addr_bytes) {
-                    let body_len = self.request_body.len();
-                    proxy_wasm::hostcalls::log(
-                        LogLevel::Debug,
-                        &format!("Forwarding request to WAF (with body, {} bytes) for IP: {}", body_len, ip_addr)
-                    ).ok();
+        if let Some(addr_bytes) = self.get_property(vec!["source", "address"]) {
+            if let Some(ip_addr) = parse_ip_from_bytes(&addr_bytes) {
+                let body_len = self.request_body.len();
+                proxy_wasm::hostcalls::log(
+                    LogLevel::Debug,
+                    &format!("Forwarding request to WAF (with body, {} bytes) for IP: {}", body_len, ip_addr)
+                ).ok();
 
-                    let body_ref = &self.request_body;
-                    match self.send_waf_request(ip_addr, Some(body_ref)) {
-                        Ok(token_id) => {
-                            proxy_wasm::hostcalls::log(
-                                LogLevel::Debug,
-                                &format!("WAF request sent successfully (with body), token_id: {}", token_id)
-                            ).ok();
-                            return Action::Pause; // Wait for WAF response
-                        }
-                        Err(e) => {
-                            proxy_wasm::hostcalls::log(
-                                LogLevel::Error,
-                                &format!("Failed to send WAF body request: {}", e),
-                            ).ok();
-                        }
+                let body_ref = &self.request_body;
+                match self.send_waf_request(ip_addr, Some(body_ref)) {
+                    Ok(token_id) => {
+                        proxy_wasm::hostcalls::log(
+                            LogLevel::Debug,
+                            &format!("WAF request sent successfully (with body), token_id: {}", token_id)
+                        ).ok();
+                        return Action::Pause; // Wait for WAF response
+                    }
+                    Err(e) => {
+                        proxy_wasm::hostcalls::log(
+                            LogLevel::Error,
+                            &format!("Failed to send WAF body request: {}", e),
+                        ).ok();
                     }
                 }
             }
-        } else {
-            proxy_wasm::hostcalls::log(
-                LogLevel::Debug,
-                &format!(
-                    "Skipping WAF body processing: waf_enabled={}, has_request_body={}",
-                    self.config.waf_enabled, self.has_request_body
-                ),
-            ).ok();
         }
 
-        // If no WAF logic is required, just continue processing
+        // If WAF logic failed, continue processing
         Action::Continue
     }
 }
