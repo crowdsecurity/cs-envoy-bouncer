@@ -17,3 +17,6 @@ target
 .vscode
 
 *.wasm
+
+#release tarball
+crowdsec-envoy-bouncer-*.tar.gz
