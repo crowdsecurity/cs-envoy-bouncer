@@ -90,18 +90,15 @@
 
 mod config;
 
-use flexbuffers;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use iprange::IpRange;
 use proxy_wasm::traits::*;
 use proxy_wasm::types::*;
 use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
-use serde_json;
 use std::cell::RefCell;
 use std::net::IpAddr;
 use std::rc::Rc;
-use uuid;
 
 use crate::config::{parse_config, FilterConfig};
 
@@ -279,15 +276,13 @@ impl RootContext for CrowdsecFilter {
 
     fn on_tick(&mut self) {
         //TODO: check if this we still have to have fake dependencies by waiting for for time before the updater is up
-        let updater_queue_id;
-
         if self.has_sent_name {
             return;
         }
         //FIXME: put the queue name in a common lib between the updater and the worker
         let queue_name = &self.config.worker_names_queue;
-        match proxy_wasm::hostcalls::resolve_shared_queue(&self.config.singleton_name, queue_name) {
-            Ok(Some(queue_id)) => updater_queue_id = queue_id,
+        let updater_queue_id = match proxy_wasm::hostcalls::resolve_shared_queue(&self.config.singleton_name, queue_name) {
+            Ok(Some(queue_id)) => queue_id,
             Ok(None) => {
                 proxy_wasm::hostcalls::log(LogLevel::Error, "Shared queue not found").ok();
                 return;
@@ -300,7 +295,7 @@ impl RootContext for CrowdsecFilter {
                 .ok();
                 return;
             }
-        }
+        };
 
         match proxy_wasm::hostcalls::enqueue_shared_queue(
             updater_queue_id,
@@ -493,7 +488,7 @@ impl CrowdsecFilterHttp {
                 LogLevel::Debug, 
                 &format!("WAF request body size: {} bytes", body_data.len())
             ).ok();
-            format!("WAF body request prepared")
+            "WAF body request prepared".to_string()
         } else {
             format!("Sending WAF request (headers only) to cluster: {}, path: {}, authority: {} with timeout: {:?}ms", 
                 cluster, path, authority, timeout.as_millis())
@@ -524,7 +519,7 @@ impl CrowdsecFilterHttp {
         }
 
         match self.dispatch_http_call(
-            &cluster,
+            cluster,
             header_pairs,
             body,
             vec![],

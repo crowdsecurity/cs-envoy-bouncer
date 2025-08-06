@@ -1,4 +1,3 @@
-use flexbuffers;
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -258,7 +257,7 @@ mod tests {
     #[test]
     fn test_send_batched() {
         // Test empty messages
-        let batches = send_batched(&[]);
+        let batches = send_batched(&[], 10, 1024);
         assert!(batches.is_ok());
         assert!(batches.unwrap().is_empty());
 
@@ -268,7 +267,7 @@ mod tests {
             remediation: "ban".to_string(),
             expiration: "".to_string(),
         }];
-        let batches = send_batched(&messages);
+        let batches = send_batched(&messages, 10, 1024);
         assert!(batches.is_ok());
         let batches = batches.unwrap();
         assert_eq!(batches.len(), 1);

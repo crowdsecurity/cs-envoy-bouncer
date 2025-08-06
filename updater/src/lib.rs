@@ -54,7 +54,6 @@
 mod config;
 mod core;
 
-use flexbuffers;
 use ipnet::IpNet;
 use log::info;
 use proxy_wasm::traits::*;
@@ -176,13 +175,13 @@ impl CrowdsecUpdater {
 
     fn remove_from_expiration_queue(&mut self, ip: &IpNet) {
         // O(1) - just mark for removal, cleanup happens later
-        self.ips_to_remove.insert(ip.clone());
+        self.ips_to_remove.insert(*ip);
     }
 
     fn add_to_expiration_queue(&mut self, ip: &IpNet, expiration: SystemTime) {
         self.expiration_queue.push(Reverse(ExpirationEntry {
             expiration,
-            ip: ip.clone(),
+            ip: *ip,
         }));
     }
 
@@ -256,7 +255,7 @@ impl CrowdsecUpdater {
             Ok(_) => {
                 proxy_wasm::hostcalls::log(
                     LogLevel::Debug,
-                    &format!("LAPI call dispatched successfully"),
+                    "LAPI call dispatched successfully",
                 )
                 .ok();
             }
@@ -400,7 +399,7 @@ impl CrowdsecUpdater {
                             .ok();
 
                             let ban_msg = BanMessage {
-                                ip: ip_net.clone(),
+                                ip: ip_net,
                                 remediation,
                                 expiration: decision
                                     .expiration
@@ -410,12 +409,12 @@ impl CrowdsecUpdater {
                             };
 
                             // Store the ban message
-                            self.bans.insert(ip_net.clone(), ban_msg.clone());
+                            self.bans.insert(ip_net, ban_msg.clone());
                             messages.push(ban_msg);
 
                             // Add to expiration queue if it has an expiration
                             if let Some(exp_time) =
-                                parse_expiration(&decision.expiration.as_deref().unwrap_or(""))
+                                parse_expiration(decision.expiration.as_deref().unwrap_or(""))
                             {
                                 self.add_to_expiration_queue(&ip_net, exp_time);
                             }
@@ -469,7 +468,7 @@ impl RootContext for CrowdsecUpdater {
     fn on_vm_start(&mut self, _vm_configuration_size: usize) -> bool {
         self.log(LogLevel::Info, "CrowdSec updater VM started");
         self.worker_names_queue_id =
-            proxy_wasm::hostcalls::register_shared_queue(&STR_WORKER_NAMES_QUEUE).ok();
+            proxy_wasm::hostcalls::register_shared_queue(STR_WORKER_NAMES_QUEUE).ok();
         true
     }
 
@@ -543,7 +542,6 @@ impl RootContext for CrowdsecUpdater {
                         &format!("Invalid UTF-8 in worker UUID: {:?}", e),
                     )
                     .ok();
-                    return;
                 }
             },
             Ok(None) => {
